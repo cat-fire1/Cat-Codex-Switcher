@@ -181,11 +181,13 @@ impl Worker {
             join: Some(join),
         }
     }
-    pub fn send(&self, command: Command) {
+    pub fn send(&self, command: Command) -> Result<()> {
         if !matches!(command, Command::Dismiss) {
             self.cancel.store(true, Ordering::SeqCst);
         }
-        let _ = self.commands.send(command);
+        self.commands
+            .send(command)
+            .map_err(|_| anyhow::anyhow!("Background worker stopped. Restart the application."))
     }
 }
 struct Engine {

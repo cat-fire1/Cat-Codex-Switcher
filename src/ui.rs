@@ -97,11 +97,20 @@ impl App {
     }
     fn send(&mut self, command: Command) {
         if let Some(worker) = &self.worker {
-            worker.send(command);
-            if !self.state.busy {
-                self.state.busy = true;
-                if let Ok(mut s) = self.shared.lock() {
-                    s.busy = true;
+            // Hold the snapshot until busy is set so a fast completion cannot be overwritten.
+            if let Ok(mut s) = self.shared.lock() {
+                match worker.send(command) {
+                    Ok(()) => {
+                        self.state.busy = true;
+                        s.busy = true;
+                    }
+                    Err(e) => {
+                        self.state.busy = false;
+                        self.state.adding = false;
+                        s.busy = false;
+                        s.adding = false;
+                        self.local_error = Some(e.to_string());
+                    }
                 }
             }
         }
@@ -123,7 +132,7 @@ impl App {
         }
         self.exit = true;
         if let Some(worker) = &self.worker {
-            worker.send(Command::Shutdown);
+            let _ = worker.send(Command::Shutdown);
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
@@ -1043,5 +1052,52 @@ fn account_info(ui: &mut egui::Ui, row: &crate::worker::Row, lang: &str) {
             i18n::t(lang, "snapshot_hint"),
             checked.with_timezone(&Local).format("%Y-%m-%d %H:%M")
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{atomic::AtomicBool, mpsc};
+
+    #[test]
+    fn disconnected_worker_does_not_block_quit() {
+        let (commands, receiver) = mpsc::channel();
+        drop(receiver);
+        let state = Snapshot {
+            busy: false,
+            error: Some("Invalid local data format".into()),
+            ..Default::default()
+        };
+        let mut app = App {
+            shared: Arc::new(Mutex::new(state.clone())),
+            state,
+            worker: Some(Worker {
+                commands,
+                cancel: Arc::new(AtomicBool::new(false)),
+                join: None,
+            }),
+            _instance: None,
+            tray: None,
+            page: Page::Accounts,
+            repository: String::new(),
+            import_path: String::new(),
+            exit: false,
+            initial_hide: false,
+            local_error: None,
+            fitted_height: 0.0,
+        };
+        for command in [Command::Dismiss, Command::Refresh] {
+            app.send(command);
+            assert!(!app.state.busy);
+            assert!(!app.shared.lock().unwrap().busy);
+            assert!(app.local_error.is_some());
+            assert_eq!(
+                app.state.error.as_deref(),
+                Some("Invalid local data format")
+            );
+        }
+        app.quit(&egui::Context::default());
+        assert!(app.exit);
     }
 }
