@@ -1,7 +1,6 @@
 use crate::windows_style::{self as win, Palette};
 use crate::{
     i18n,
-    model::*,
     platform::{self, Instance},
     tray::Shell,
     worker::{Command, Snapshot, Worker},
@@ -35,57 +34,21 @@ pub struct App {
     import_path: String,
     exit: bool,
     initial_hide: bool,
-    fixture: bool,
-    screenshot: Option<PathBuf>,
-    capture_frames: u32,
-    quit_after_capture: bool,
     local_error: Option<String>,
     fitted_height: f32,
-}
-pub struct Options {
-    pub fixture: bool,
-    pub shell_fixture: bool,
-    pub empty: bool,
-    pub language: String,
-    pub theme: Option<String>,
-    pub scale: Option<f32>,
-    pub page: String,
-    pub screenshot: Option<PathBuf>,
-    pub quit_after_capture: bool,
-    pub background: bool,
-    pub five_hour: bool,
 }
 impl App {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         instance: Option<Instance>,
-        options: Options,
+        background: bool,
     ) -> Self {
-        if let Some(theme) = &options.theme {
-            cc.egui_ctx.set_theme(if theme == "dark" {
-                egui::Theme::Dark
-            } else {
-                egui::Theme::Light
-            });
-        }
-        if let Some(scale) = options.scale {
-            cc.egui_ctx.set_pixels_per_point(scale);
-        }
         win::install_fonts(&cc.egui_ctx);
         win::configure(&cc.egui_ctx);
         let mut local_error = None;
-        let mut state = if options.fixture {
-            fixture(&options.language, options.empty)
-        } else {
-            Snapshot::default()
-        };
-        if options.fixture {
-            state.settings.shows_five_hour_usage = options.five_hour;
-        }
+        let state = Snapshot::default();
         let shared = Arc::new(Mutex::new(state.clone()));
-        let tray = if options.fixture && !options.shell_fixture {
-            None
-        } else {
+        let tray = {
             let window = cc.window_handle().ok().and_then(|h| match h.as_raw() {
                 RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
                 _ => None,
@@ -108,31 +71,12 @@ impl App {
                 }
             }
         };
-        let worker = if options.fixture {
-            None
-        } else {
-            Some(Worker::start(
-                platform::local_data().join("Cat Codex Switcher"),
-                platform::active_home(),
-                cc.egui_ctx.clone(),
-                shared.clone(),
-            ))
-        };
-        let page = match options.page.as_str() {
-            "settings" => Page::Settings,
-            "manage" => Page::Manage,
-            "switch" => state
-                .rows
-                .first()
-                .map(|r| Page::Switch(r.profile.id))
-                .unwrap_or(Page::Accounts),
-            "remove" => state
-                .rows
-                .last()
-                .map(|r| Page::Remove(r.profile.id))
-                .unwrap_or(Page::Accounts),
-            _ => Page::Accounts,
-        };
+        let worker = Some(Worker::start(
+            platform::local_data().join("Cat Codex Switcher"),
+            platform::active_home(),
+            cc.egui_ctx.clone(),
+            shared.clone(),
+        ));
         Self {
             repository: state.settings.update_repository.clone(),
             state,
@@ -140,17 +84,13 @@ impl App {
             _instance: instance,
             tray,
             shared,
-            page,
+            page: Page::Accounts,
             import_path: platform::local_data()
                 .join("Codex Account Switcher")
                 .display()
                 .to_string(),
             exit: false,
-            initial_hide: options.background,
-            fixture: options.fixture,
-            screenshot: options.screenshot,
-            capture_frames: 0,
-            quit_after_capture: options.quit_after_capture,
+            initial_hide: background,
             local_error,
             fitted_height: 0.0,
         }
@@ -688,7 +628,6 @@ impl App {
                 win::muted(ui, i18n::t(lang, "experiment_hint"), 10.5);
                 ui.add_space(8.0);
                 if win::button(ui, i18n::t(lang, "open_log"), None).clicked()
-                    && !self.fixture
                     && let Err(e) =
                         platform::open(platform::local_data().join("Cat Codex Switcher"))
                 {
@@ -751,11 +690,7 @@ impl App {
                 });
             });
         if s != self.state.settings {
-            if self.fixture {
-                self.state.settings = s;
-            } else {
-                self.send(Command::Settings(s));
-            }
+            self.send(Command::Settings(s));
         }
     }
     fn confirmation(&mut self, ui: &mut egui::Ui, lang: &str, id: Uuid, remove: bool) {
@@ -851,16 +786,12 @@ impl eframe::App for App {
             self.page = Page::Accounts;
         }
         win::configure(ctx);
-        let maximum = if self.fixture {
-            900.0
-        } else {
-            ctx.input(|i| {
-                i.viewport()
-                    .monitor_size
-                    .map(|s| s.y - 90.0)
-                    .unwrap_or(800.0)
-            })
-        };
+        let maximum = ctx.input(|i| {
+            i.viewport()
+                .monitor_size
+                .map(|s| s.y - 90.0)
+                .unwrap_or(800.0)
+        });
         let panel = egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(Palette::current_from_context(ctx).surface))
             .show(ctx, |ui| {
@@ -934,49 +865,7 @@ impl eframe::App for App {
                     });
                 });
         }
-        if self.fixture && self.screenshot.is_some() {
-            self.capture_frames += 1;
-            if self.capture_frames == 4 {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
-            }
-            let captured = ctx.input(|i| {
-                i.events.iter().find_map(|e| {
-                    if let egui::Event::Screenshot { image, .. } = e {
-                        Some(image.clone())
-                    } else {
-                        None
-                    }
-                })
-            });
-            if let Some(image) = captured
-                && let Some(path) = self.screenshot.take()
-            {
-                let bytes: Vec<_> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
-                if let Err(e) = image::save_buffer(
-                    path,
-                    &bytes,
-                    image.width() as u32,
-                    image.height() as u32,
-                    image::ColorType::Rgba8,
-                ) {
-                    self.local_error = Some(e.to_string());
-                }
-                if self.quit_after_capture {
-                    self.exit = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            }
-        }
-        ctx.request_repaint_after(if self.fixture && self.screenshot.is_some() {
-            Duration::from_millis(80)
-        } else {
-            Duration::from_millis(400)
-        });
-        if self.fixture
-            && let Ok(mut state) = self.shared.lock()
-        {
-            *state = self.state.clone();
-        }
+        ctx.request_repaint_after(Duration::from_millis(400));
     }
 }
 impl Drop for App {
@@ -1124,178 +1013,5 @@ fn account_info(ui: &mut egui::Ui, row: &crate::worker::Row, lang: &str) {
             i18n::t(lang, "snapshot_hint"),
             checked.with_timezone(&Local).format("%Y-%m-%d %H:%M")
         ));
-    }
-}
-pub fn fixture(language: &str, empty: bool) -> Snapshot {
-    let mut state = Snapshot {
-        busy: false,
-        ..Default::default()
-    };
-    state.settings.language = language.into();
-    state.settings.shows_five_hour_usage = false;
-    if empty {
-        return state;
-    }
-    for (index, email) in [
-        "cat@example.invalid",
-        "a-very-long-account-name-for-layout-testing@example.invalid",
-        "work@example.invalid",
-    ]
-    .iter()
-    .enumerate()
-    {
-        let profile = Identity {
-            account_id: Some(format!("fixture-{index}")),
-            email: Some((*email).into()),
-        }
-        .profile();
-        if index == 0 {
-            state.active = Some(profile.id);
-        }
-        state.rows.push(crate::worker::Row {
-            profile,
-            usage: Some(Usage {
-                remaining_percent: [74, 32, 8][index],
-                resets_at: Utc::now() + chrono::Duration::days(3),
-                five_hour_remaining_percent: Some([92, 51, 10][index]),
-                five_hour_resets_at: Some(Utc::now() + chrono::Duration::hours(2)),
-                reset_credits_remaining: Some(index as i64),
-                reset_credits: None,
-            }),
-            stale: index == 2,
-            error: None,
-            subscription: Some((Utc::now() + chrono::Duration::days(12), Utc::now())),
-        });
-    }
-    state
-}
-
-#[cfg(test)]
-mod layout_tests {
-    use super::*;
-    fn app() -> App {
-        let state = fixture("en", false);
-        App {
-            shared: Arc::new(Mutex::new(state.clone())),
-            state,
-            worker: None,
-            _instance: None,
-            tray: None,
-            page: Page::Accounts,
-            repository: String::new(),
-            import_path: String::new(),
-            exit: false,
-            initial_hide: false,
-            fixture: true,
-            screenshot: None,
-            capture_frames: 0,
-            quit_after_capture: false,
-            local_error: None,
-            fitted_height: 0.0,
-        }
-    }
-    fn draw(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::Rect {
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(420.0, 900.0),
-            )),
-            events,
-            ..Default::default()
-        };
-        let mut used = egui::Rect::NOTHING;
-        let _ = ctx.run(input, |ctx| {
-            win::configure(ctx);
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    let lang = i18n::language(&app.state.settings.language);
-                    app.header(ui, &lang);
-                    match app.page {
-                        Page::Accounts => app.accounts(ui, &lang, false),
-                        Page::Manage => app.accounts(ui, &lang, true),
-                        Page::Settings => app.settings(ui, &lang),
-                        Page::Switch(id) => app.confirmation(ui, &lang, id, false),
-                        Page::Remove(id) => app.confirmation(ui, &lang, id, true),
-                    }
-                    used = ui.min_rect();
-                });
-        });
-        used
-    }
-    fn click(app: &mut App, ctx: &egui::Context, pos: egui::Pos2) {
-        draw(app, ctx, vec![egui::Event::PointerMoved(pos)]);
-        for pressed in [true, false] {
-            draw(
-                app,
-                ctx,
-                vec![
-                    egui::Event::PointerMoved(pos),
-                    egui::Event::PointerButton {
-                        pos,
-                        button: egui::PointerButton::Primary,
-                        pressed,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-            );
-        }
-    }
-    #[test]
-    fn original_navigation_and_entire_account_row_hit_targets_work() {
-        let ctx = egui::Context::default();
-        win::install_fonts(&ctx);
-        let mut app = app();
-        draw(&mut app, &ctx, vec![]);
-        click(&mut app, &ctx, egui::pos2(300.0, 173.0));
-        assert!(matches!(app.page,Page::Switch(id) if id==app.state.rows[1].profile.id));
-        click(&mut app, &ctx, egui::pos2(36.0, 32.0));
-        assert!(app.page == Page::Accounts);
-        click(&mut app, &ctx, egui::pos2(380.0, 32.0));
-        assert!(app.page == Page::Settings);
-        click(&mut app, &ctx, egui::pos2(36.0, 32.0));
-        click(&mut app, &ctx, egui::pos2(310.0, 32.0));
-        assert!(app.page == Page::Manage);
-        click(&mut app, &ctx, egui::pos2(363.0, 149.0));
-        assert!(matches!(app.page,Page::Remove(id) if id==app.state.rows[1].profile.id));
-        click(&mut app, &ctx, egui::pos2(36.0, 32.0));
-        assert!(app.page == Page::Manage);
-    }
-    #[test]
-    fn active_row_is_not_switchable_and_busy_rows_ignore_clicks() {
-        let ctx = egui::Context::default();
-        win::install_fonts(&ctx);
-        let mut app = app();
-        draw(&mut app, &ctx, vec![]);
-        click(&mut app, &ctx, egui::pos2(200.0, 100.0));
-        assert!(app.page == Page::Accounts);
-        app.state.busy = true;
-        click(&mut app, &ctx, egui::pos2(200.0, 173.0));
-        assert!(app.page == Page::Accounts);
-    }
-    #[test]
-    fn compact_screens_fit_the_source_window_width_in_all_languages() {
-        let ctx = egui::Context::default();
-        win::install_fonts(&ctx);
-        let mut app = app();
-        for lang in ["uk", "en", "ru"] {
-            app.state.settings.language = lang.into();
-            for page in [
-                Page::Accounts,
-                Page::Manage,
-                Page::Settings,
-                Page::Switch(app.state.rows[1].profile.id),
-                Page::Remove(app.state.rows[1].profile.id),
-            ] {
-                app.page = page;
-                for _ in 0..2 {
-                    let rect = draw(&mut app, &ctx, vec![]);
-                    assert!(
-                        rect.width() <= 421.0,
-                        "Page extends beyond the source's 420px window"
-                    );
-                }
-            }
-        }
     }
 }

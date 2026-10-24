@@ -39,18 +39,13 @@ Credentials зберігаються локально як повні `auth.json
 cd <project-folder>
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --all-targets
 cargo build --locked --release --bin Cat-Codex-Switcher
-./scripts/package.ps1
-./scripts/capture-ui.ps1
 ```
 
-У пісочницях, що забороняють DACL, junction або GUI, відповідні тести слід запускати зі звичайного користувацького Windows-сеансу. Тести працюють лише з тимчасовими даними й окремим `rpc-fixture.exe`, який не входить до portable-пакета.
+Готовий файл після збірки: target/release/Cat-Codex-Switcher.exe. Його можна скопіювати в dist разом із LICENSE і повідомленнями залежностей. У проєкті залишено потрібний для іконки та властивостей Windows EXE build.rs; допоміжні скрипти, тести, self-test і режими вигаданих акаунтів видалені за запитом користувача.
 
-`--self-test` перевіряє сховище на вигаданих credentials у тимчасовій папці. Для машинного результату задайте `CAT_SWITCHER_SELF_TEST_RESULT`. Режим `--ui-fixture` не запускає роботу з акаунтами: `--language uk|en|ru`, `--theme light|dark`, `--scale 1|1.5|2`, `--page accounts|manage|settings|switch|remove`, `--empty`, `--five-hour`, `--screenshot <path>`, `--quit-after-capture`.
-
-Дивіться `PARITY.md` для матриці функцій і фактичних меж перевірки. Реальний браузерний вхід та handoff слід остаточно перевірити в окремому Windows-профілі з тестовими акаунтами.
+Реальний браузерний вхід та handoff слід остаточно перевірити в окремому Windows-профілі з тестовими акаунтами. Відомості про попередні перевірки зберігаються в історії Git.
 
 ## Ліцензія
 
-MIT. Оригінальний Codex Account Switcher © 2026 liuzhao1225. Повідомлення збережено в `LICENSE`; бібліотечні повідомлення додаються в `dist/THIRD-PARTY-NOTICES.txt` під час пакування.
+MIT. Оригінальний Codex Account Switcher © 2026 liuzhao1225. Повідомлення збережено в `LICENSE`; бібліотечні повідомлення для готового пакета збережені в dist/THIRD-PARTY-NOTICES.txt.
