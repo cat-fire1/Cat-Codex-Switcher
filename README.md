@@ -53,6 +53,7 @@ Credentials зберігаються локально як повні `auth.json
 git clone https://github.com/cat-fire1/Cat-Codex-Switcher.git
 cd Cat-Codex-Switcher
 cargo fmt --check
+cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked --release --bin Cat-Codex-Switcher
 .\target\release\Cat-Codex-Switcher.exe
@@ -75,7 +76,7 @@ cargo build --locked --release --bin Cat-Codex-Switcher
 
 ## Стан перевірок
 
-У поточному дереві немає автоматизованих тестів, self-test або fixture-режимів. Попередні перевірки описані в [PARITY.md](PARITY.md); їхній код доступний в історії Git. Цей звіт не є гарантією перевірки кожної поточної ревізії.
+Регресійні тести перевіряють вихід після зупинки worker, відновлення Desktop після помилок перемикання та продовження оновлення збережених профілів при пошкодженому активному вході. Тести використовують підставні операції й тимчасові дані, без реальних акаунтів. Файлова перевірка потребує права встановлювати DACL у тимчасовій папці. Попередні перевірки описані в [PARITY.md](PARITY.md); їхній код доступний в історії Git. Цей звіт не є гарантією перевірки кожної поточної ревізії.
 
 Реальний браузерний вхід та handoff слід остаточно перевірити в окремому Windows-профілі з тестовими акаунтами. Відомості про попередні перевірки зберігаються в історії Git.
 

@@ -164,6 +164,8 @@ impl Worker {
                 Ok(())
             };
             if let Err(e) = run() {
+                // Reject commands before publishing an idle state for a stopped worker.
+                drop(rx);
                 let s = Snapshot {
                     busy: false,
                     error: Some(format!("{e:#}")),
@@ -376,8 +378,7 @@ impl Engine {
         };
         if let Err(e) = self.store.sync_current() {
             self.state.error = Some(format!("{e:#}"));
-            self.publish();
-            return;
+            // Saved profiles have independent credentials and can still be refreshed.
         }
         self.state.stage = "refresh".into();
         self.publish();
@@ -456,5 +457,102 @@ impl Engine {
             }
         }
         self.publish();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_active_login_still_refreshes_saved_profiles() {
+        // Isolate runtime discovery from the user's environment and real accounts.
+        if std::env::var_os("SWITCHER_REFRESH_TEST_CHILD").is_none() {
+            let missing = std::env::temp_dir().join(Uuid::new_v4().to_string());
+            let status = platform::hidden_command(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "worker::tests::invalid_active_login_still_refreshes_saved_profiles",
+                ])
+                .env("SWITCHER_REFRESH_TEST_CHILD", "1")
+                .env("CODEX_CLI_PATH", missing.join("missing.exe"))
+                .env("CODEX_SWITCHER_DATA_HOME", &missing)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("switcher-test-{}", Uuid::new_v4()));
+        let mut store = Store::load(root.join("store"), root.join("active")).unwrap();
+        let profiles: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|id| {
+                Identity {
+                    account_id: Some(id.into()),
+                    email: None,
+                }
+                .profile()
+            })
+            .collect();
+        store
+            .save_registry(Registry {
+                format_version: FORMAT,
+                active_account_id: Some(profiles[0].id),
+                accounts: profiles.clone(),
+            })
+            .unwrap();
+        platform::atomic_write(&store.active_file(), b"invalid JSON").unwrap();
+        for profile in &profiles {
+            store
+                .cache(
+                    profile.id,
+                    Usage {
+                        remaining_percent: 42,
+                        resets_at: Utc::now(),
+                        five_hour_remaining_percent: None,
+                        five_hour_resets_at: None,
+                        reset_credits_remaining: None,
+                        reset_credits: None,
+                    },
+                )
+                .unwrap();
+        }
+        let mut engine = Engine {
+            store,
+            state: Snapshot::default(),
+            errors: HashMap::new(),
+            experiment: None,
+            shared: Arc::new(Mutex::new(Snapshot::default())),
+            ctx: egui::Context::default(),
+            token: Arc::new(AtomicBool::new(false)),
+            rt: tokio::runtime::Runtime::new().unwrap(),
+        };
+        engine.refresh();
+        assert!(
+            engine
+                .state
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Invalid credential JSON")
+        );
+        assert_eq!(engine.state.rows.len(), 2);
+        for row in &engine.state.rows {
+            assert!(row.stale);
+            assert!(
+                row.error
+                    .as_deref()
+                    .unwrap()
+                    .contains("Codex runtime not found")
+            );
+            assert_eq!(row.usage.as_ref().unwrap().remaining_percent, 42);
+        }
+        assert_eq!(
+            platform::read(&engine.store.active_file()).unwrap(),
+            b"invalid JSON"
+        );
+        drop(engine);
+        platform::remove_tree(&root, &temp).unwrap();
     }
 }
