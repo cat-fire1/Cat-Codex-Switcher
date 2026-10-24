@@ -418,7 +418,7 @@ impl App {
             ui.add(
                 egui::TextEdit::singleline(&mut self.repository)
                     .hint_text("owner/repository")
-                    .desired_width(ui.available_width() - 110.0),
+                    .desired_width(ui.available_width() - 140.0),
             );
             if ui.button(i18n::t(lang, "save")).clicked() {
                 s.update_repository = self.repository.trim().into();

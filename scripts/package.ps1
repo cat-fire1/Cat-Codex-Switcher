@@ -19,6 +19,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $destination -Force
     Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md') -Destination $destination -Force
     Copy-Item -LiteralPath (Join-Path $projectRoot 'PARITY.md') -Destination $destination -Force
+    & (Join-Path $PSScriptRoot 'check-pe.ps1') -Executable (Join-Path $destination 'Cat-Codex-Switcher.exe') | Set-Content -LiteralPath (Join-Path $destination 'binary-check.txt')
     & (Join-Path $PSScriptRoot 'third-party-notices.ps1') -Output (Join-Path $destination 'THIRD-PARTY-NOTICES.txt')
     $previousResult = $env:CAT_SWITCHER_SELF_TEST_RESULT
     try {
