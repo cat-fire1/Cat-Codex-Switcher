@@ -493,6 +493,10 @@ impl App {
                             true,
                         );
                     });
+                    if self.state.adding {
+                        ui.add_space(8.0);
+                        ui.add(egui::Label::new(i18n::t(lang, "login_cancel_hint")).wrap());
+                    }
                     ui.add_space(8.0);
                     if ui
                         .add_enabled_ui(!self.state.busy && !self.state.adding, |ui| {
@@ -782,8 +786,14 @@ impl eframe::App for App {
                 self.quit(ctx);
             }
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !self.state.busy {
-            self.page = Page::Accounts;
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.state.adding {
+                if let Some(worker) = &self.worker {
+                    worker.cancel.store(true, Ordering::SeqCst);
+                }
+            } else if !self.state.busy {
+                self.page = Page::Accounts;
+            }
         }
         win::configure(ctx);
         let maximum = ctx.input(|i| {
@@ -798,7 +808,7 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        ui.set_width(420.0);
+                        ui.set_width(ui.available_width());
                         if let Some(error) = self
                             .local_error
                             .clone()
@@ -808,11 +818,24 @@ impl eframe::App for App {
                                 .inner_margin(egui::Margin::symmetric(12, 8))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        win::muted(ui, error, 11.0);
-                                        if win::button(ui, "×", None).clicked() {
-                                            self.local_error = None;
-                                            self.send(Command::Dismiss);
-                                        }
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::TOP),
+                                            |ui| {
+                                                if win::button(ui, "×", None)
+                                                    .on_hover_text(i18n::t(&lang, "dismiss"))
+                                                    .clicked()
+                                                {
+                                                    self.local_error = None;
+                                                    self.send(Command::Dismiss);
+                                                }
+                                                egui::ScrollArea::vertical()
+                                                    .id_salt("operation-error")
+                                                    .max_height(96.0)
+                                                    .show(ui, |ui| {
+                                                        ui.add(egui::Label::new(error).wrap());
+                                                    });
+                                            },
+                                        );
                                     });
                                 });
                             win::rule(ui);
@@ -829,7 +852,14 @@ impl eframe::App for App {
                         }
                     })
             });
-        let height = panel.inner.content_size.y.clamp(130.0, maximum);
+        // Transient login/error messages must not resize the native window.
+        let height = if self.fitted_height > 0.0
+            && (self.state.adding || self.local_error.is_some() || self.state.error.is_some())
+        {
+            self.fitted_height.clamp(130.0, maximum)
+        } else {
+            panel.inner.content_size.y.clamp(130.0, maximum)
+        };
         if (height - self.fitted_height).abs() > 0.5 {
             self.fitted_height = height;
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(420.0, height)));

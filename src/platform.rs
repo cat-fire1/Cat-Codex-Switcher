@@ -371,8 +371,9 @@ impl Desktop {
         use windows::{
             Data::Xml::Dom::XmlDocument,
             Management::Deployment::PackageManager,
+            Storage::{IStorageFile, StorageFile},
             Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize},
-            core::HSTRING,
+            core::{HSTRING, Interface},
         };
         unsafe {
             CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
@@ -393,9 +394,12 @@ impl Desktop {
                 continue;
             }
             let location = PathBuf::from(package.InstalledLocation()?.Path()?.to_string());
-            let manifest = fs::read_to_string(location.join("AppxManifest.xml"))?;
-            let xml = XmlDocument::new()?;
-            xml.LoadXml(&HSTRING::from(manifest))?;
+            // The file loader handles the BOM and XML encoding declaration together.
+            let manifest = StorageFile::GetFileFromPathAsync(&HSTRING::from(
+                location.join("AppxManifest.xml").as_os_str(),
+            ))?
+            .get()?;
+            let xml = XmlDocument::LoadFromFileAsync(&manifest.cast::<IStorageFile>()?)?.get()?;
             let app=xml.SelectSingleNode(&HSTRING::from("/*[local-name()='Package']/*[local-name()='Applications']/*[local-name()='Application'][1]"))?;
             let attr = app.Attributes()?;
             let executable = location.join(

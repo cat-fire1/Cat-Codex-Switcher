@@ -28,6 +28,11 @@ pub fn t<'a>(language: &str, key: &'a str) -> &'a str {
             "Sign in through your browser",
             "Вход откроется в браузере",
         ],
+        "login_cancel_hint" => [
+            "Якщо закрили браузер, натисніть «Скасувати» або Esc. Закриття браузера не завершує очікування входу.",
+            "If you closed the browser, click Cancel or press Esc. Closing the browser does not cancel sign-in.",
+            "Если закрыли браузер, нажмите «Отмена» или Esc. Закрытие браузера не отменяет ожидание входа.",
+        ],
         "cancel" => ["Скасувати", "Cancel", "Отмена"],
         "confirm" => ["Підтвердити", "Confirm", "Подтвердить"],
         "switch" => [

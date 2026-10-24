@@ -116,6 +116,9 @@ impl Worker {
                         Ok(command) => {
                             engine.token.store(false, Ordering::SeqCst);
                             engine.state.busy = true;
+                            if !matches!(command, Command::Dismiss) {
+                                engine.state.error = None;
+                            }
                             engine.publish();
                             let result = engine.command(command);
                             if let Err(e) = result
