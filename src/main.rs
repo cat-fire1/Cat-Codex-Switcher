@@ -52,8 +52,8 @@ fn run() -> anyhow::Result<()> {
         quit_after_capture: args.iter().any(|a| a == "--quit-after-capture"),
         background: args.iter().any(|a| a == "--background"),
     };
-    let image = image::load_from_memory(include_bytes!("../assets/account-switcher-logo.png"))?
-        .to_rgba8();
+    let image =
+        image::load_from_memory(include_bytes!("../assets/account-switcher-logo.png"))?.to_rgba8();
     let icon = egui::IconData {
         width: image.width(),
         height: image.height(),
@@ -67,9 +67,9 @@ fn run() -> anyhow::Result<()> {
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Cat Codex Switcher")
-            .with_inner_size([440.0 * fixture_scale, 600.0 * fixture_scale])
+            .with_inner_size([500.0 * fixture_scale, 720.0 * fixture_scale])
             .with_clamp_size_to_monitor_size(false)
-            .with_min_inner_size([400.0, 350.0])
+            .with_min_inner_size([460.0, 420.0])
             .with_icon(icon),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()

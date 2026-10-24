@@ -224,6 +224,13 @@ fn icon(percent: Option<i32>, dark: bool) -> Result<tray_icon::Icon> {
             .to_rgba8();
         return Ok(tray_icon::Icon::from_rgba(image.into_raw(), 32, 32)?);
     };
+    Ok(tray_icon::Icon::from_rgba(
+        number_rgba(percent, dark),
+        32,
+        32,
+    )?)
+}
+fn number_rgba(percent: i32, dark: bool) -> Vec<u8> {
     let digits = [
         [7, 5, 5, 5, 7],
         [2, 6, 2, 2, 7],
@@ -237,9 +244,15 @@ fn icon(percent: Option<i32>, dark: bool) -> Result<tray_icon::Icon> {
         [7, 5, 7, 1, 7],
     ];
     let text = percent.clamp(0, 100).to_string();
-    let scale = 2;
-    let width = text.len() * 8 - 2;
+    let scale = match text.len() {
+        1 => 5,
+        2 => 4,
+        _ => 3,
+    };
+    let gap = 2;
+    let width = text.len() * 3 * scale + (text.len() - 1) * gap;
     let left = (32 - width) / 2;
+    let top = (32 - 5 * scale) / 2;
     let mut rgba = vec![0u8; 32 * 32 * 4];
     let ink = if dark { 255 } else { 0 };
     for (index, digit) in text.bytes().enumerate() {
@@ -248,9 +261,12 @@ fn icon(percent: Option<i32>, dark: bool) -> Result<tray_icon::Icon> {
                 if row & (1 << (2 - x)) != 0 {
                     for dy in 0..scale {
                         for dx in 0..scale {
-                            let i =
-                                ((11 + y * scale + dy) * 32 + left + index * 8 + x * scale + dx)
-                                    * 4;
+                            let i = ((top + y * scale + dy) * 32
+                                + left
+                                + index * (3 * scale + gap)
+                                + x * scale
+                                + dx)
+                                * 4;
                             rgba[i..i + 4].copy_from_slice(&[ink, ink, ink, 255]);
                         }
                     }
@@ -258,11 +274,29 @@ fn icon(percent: Option<i32>, dark: bool) -> Result<tray_icon::Icon> {
             }
         }
     }
-    Ok(tray_icon::Icon::from_rgba(rgba, 32, 32)?)
+    rgba
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn enlarged_tray_numbers_fit_for_every_percentage() {
+        for dark in [false, true] {
+            for percent in 0..=100 {
+                let rgba = number_rgba(percent, dark);
+                assert_eq!(rgba.len(), 32 * 32 * 4);
+                let ys: Vec<_> = rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| p[3] != 0)
+                    .map(|(i, _)| i / 32)
+                    .collect();
+                assert!(*ys.iter().max().unwrap() - *ys.iter().min().unwrap() + 1 >= 15);
+            }
+        }
+    }
     #[test]
     fn native_tray_updates_icons_and_delivers_left_click() {
         use windows::{

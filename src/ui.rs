@@ -69,8 +69,18 @@ impl App {
             cc.egui_ctx.set_pixels_per_point(scale);
         }
         cc.egui_ctx.style_mut(|s| {
-            s.spacing.item_spacing = egui::vec2(8.0, 9.0);
-            s.spacing.button_padding = egui::vec2(10.0, 6.0);
+            for (style, size) in [
+                (egui::TextStyle::Body, 17.0),
+                (egui::TextStyle::Button, 17.0),
+                (egui::TextStyle::Small, 14.5),
+                (egui::TextStyle::Heading, 24.0),
+                (egui::TextStyle::Monospace, 16.0),
+            ] {
+                s.text_styles
+                    .insert(style, egui::FontId::proportional(size));
+            }
+            s.spacing.item_spacing = egui::vec2(9.0, 11.0);
+            s.spacing.button_padding = egui::vec2(11.0, 7.0);
         });
         let mut local_error = None;
         let state = if options.fixture {
@@ -235,7 +245,7 @@ impl App {
                     ui.set_min_width(ui.available_width());
                     ui.horizontal(|ui| {
                         let width =
-                            (ui.available_width() - if manage { 92.0 } else { 12.0 }).max(80.0);
+                            (ui.available_width() - if manage { 120.0 } else { 12.0 }).max(80.0);
                         ui.allocate_ui_with_layout(
                             egui::vec2(width, 24.0),
                             egui::Layout::left_to_right(egui::Align::Center),
@@ -408,7 +418,7 @@ impl App {
             ui.add(
                 egui::TextEdit::singleline(&mut self.repository)
                     .hint_text("owner/repository")
-                    .desired_width(ui.available_width() - 90.0),
+                    .desired_width(ui.available_width() - 110.0),
             );
             if ui.button(i18n::t(lang, "save")).clicked() {
                 s.update_repository = self.repository.trim().into();
