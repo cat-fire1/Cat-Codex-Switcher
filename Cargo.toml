@@ -1,0 +1,45 @@
+[package]
+name = "cat-codex-switcher"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Personal Rust Windows Codex account switcher"
+
+[[bin]]
+name = "Cat-Codex-Switcher"
+path = "src/main.rs"
+
+[[bin]]
+name = "rpc-fixture"
+path = "tests/support/rpc_fixture.rs"
+test = false
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+eframe = { version = "0.31.1", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
+egui = "0.31.1"
+raw-window-handle = "0.6"
+image = { version = "0.25", default-features = false, features = ["png"] }
+wgpu = { version = "24", features = ["dx12", "wgsl"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "time", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tray-icon = "0.19.3"
+rfd = "0.15"
+sha2 = "0.10"
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_Registry", "Win32_System_Diagnostics_ToolHelp", "Win32_Storage_Packaging_Appx", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_Memory", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_System_Com", "Foundation_Collections", "Management_Deployment", "ApplicationModel", "Storage", "Data_Xml_Dom"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+winres = "0.1.12"
+
+[profile.release]
+lto = "thin"
+strip = true
+
