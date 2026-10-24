@@ -437,22 +437,25 @@ pub trait Handoff {
 }
 pub fn handoff(h: &mut impl Handoff) -> Result<()> {
     h.close().context("closeDesktop")?;
-    h.save().context("saveCurrentCredential")?;
-    h.activate().context("activateTargetCredential")?;
-    for stage in ["verifyTargetIdentity", "commitActiveAccountID"] {
-        let result = if stage == "verifyTargetIdentity" {
-            h.verify()
-        } else {
-            h.commit()
-        };
-        if let Err(e) = result {
-            return match h.restore() {
-                Ok(()) => Err(e.context(stage)),
-                Err(r) => Err(anyhow::anyhow!(
-                    "{stage}: {e}; restoring original credential also failed: {r}"
-                )),
-            };
+    let mut activated = false;
+    let result = (|| -> Result<()> {
+        h.save().context("saveCurrentCredential")?;
+        h.activate().context("activateTargetCredential")?;
+        activated = true;
+        h.verify().context("verifyTargetIdentity")?;
+        h.commit().context("commitActiveAccountID")
+    })();
+    if let Err(e) = result {
+        if activated && let Err(r) = h.restore() {
+            bail!("{e:#}; restoring original credential also failed: {r:#}");
         }
+        // Failed activation is atomic; the original login is still safe to reopen.
+        return match h.reopen() {
+            Ok(()) => Err(e),
+            Err(r) => Err(anyhow::anyhow!(
+                "{e:#}; reopenDesktop also failed: {r:#}. Open Desktop manually."
+            )),
+        };
     }
     h.reopen()
         .context("Account switched; reopenDesktop failed. Open Desktop manually.")
@@ -499,4 +502,92 @@ pub fn switch(store: &mut Store, target: Uuid) -> Result<()> {
         original,
         desktop,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct FakeHandoff {
+        failures: Vec<&'static str>,
+        calls: Vec<&'static str>,
+    }
+    impl FakeHandoff {
+        fn step(&mut self, name: &'static str) -> Result<()> {
+            self.calls.push(name);
+            ensure!(!self.failures.contains(&name), "failed {name}");
+            Ok(())
+        }
+    }
+    impl Handoff for FakeHandoff {
+        fn close(&mut self) -> Result<()> {
+            self.step("close")
+        }
+        fn save(&mut self) -> Result<()> {
+            self.step("save")
+        }
+        fn activate(&mut self) -> Result<()> {
+            self.step("activate")
+        }
+        fn verify(&mut self) -> Result<()> {
+            self.step("verify")
+        }
+        fn commit(&mut self) -> Result<()> {
+            self.step("commit")
+        }
+        fn restore(&mut self) -> Result<()> {
+            self.step("restore")
+        }
+        fn reopen(&mut self) -> Result<()> {
+            self.step("reopen")
+        }
+    }
+
+    #[test]
+    fn handoff_recovers_each_failure_boundary() {
+        for (failure, expected) in [
+            ("close", vec!["close"]),
+            ("save", vec!["close", "save", "reopen"]),
+            ("activate", vec!["close", "save", "activate", "reopen"]),
+            (
+                "verify",
+                vec!["close", "save", "activate", "verify", "restore", "reopen"],
+            ),
+            (
+                "commit",
+                vec![
+                    "close", "save", "activate", "verify", "commit", "restore", "reopen",
+                ],
+            ),
+        ] {
+            let mut h = FakeHandoff {
+                failures: vec![failure],
+                ..Default::default()
+            };
+            let error = handoff(&mut h).unwrap_err();
+            assert!(format!("{error:#}").contains(&format!("failed {failure}")));
+            assert_eq!(h.calls, expected);
+        }
+    }
+
+    #[test]
+    fn handoff_preserves_recovery_errors_and_stops_after_failed_restore() {
+        for recovery in ["restore", "reopen"] {
+            let mut h = FakeHandoff {
+                failures: vec!["verify", recovery],
+                ..Default::default()
+            };
+            let error = format!("{:#}", handoff(&mut h).unwrap_err());
+            assert!(error.contains("failed verify"));
+            assert!(error.contains(&format!("failed {recovery}")));
+            assert_eq!(h.calls.last(), Some(&recovery));
+        }
+        let mut h = FakeHandoff::default();
+        handoff(&mut h).unwrap();
+        assert_eq!(
+            h.calls,
+            ["close", "save", "activate", "verify", "commit", "reopen"]
+        );
+    }
 }
