@@ -3,6 +3,7 @@ use cat_codex_switcher::{experiment, model, platform, rpc, store, updates};
 mod i18n;
 mod tray;
 mod ui;
+mod windows_style;
 mod worker;
 
 fn main() {
@@ -51,6 +52,7 @@ fn run() -> anyhow::Result<()> {
         },
         quit_after_capture: args.iter().any(|a| a == "--quit-after-capture"),
         background: args.iter().any(|a| a == "--background"),
+        five_hour: fixture && args.iter().any(|a| a == "--five-hour"),
     };
     let image =
         image::load_from_memory(include_bytes!("../assets/account-switcher-logo.png"))?.to_rgba8();
@@ -67,9 +69,10 @@ fn run() -> anyhow::Result<()> {
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Cat Codex Switcher")
-            .with_inner_size([500.0 * fixture_scale, 720.0 * fixture_scale])
+            .with_inner_size([420.0 * fixture_scale, 320.0 * fixture_scale])
             .with_clamp_size_to_monitor_size(false)
-            .with_min_inner_size([460.0, 420.0])
+            .with_resizable(false)
+            .with_maximize_button(false)
             .with_icon(icon),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()

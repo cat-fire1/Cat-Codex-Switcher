@@ -1,6 +1,6 @@
 # Cat Codex Switcher
 
-Персональна Windows-версія Codex Account Switcher: ядро та egui/eframe-інтерфейс на Rust. Еталон — Windows-код оригіналу 0.1.25. Мови: українська, англійська, російська та системний вибір. Системні мови поза цим набором використовують англійську.
+Персональна Windows-версія Codex Account Switcher з компонуванням інтерфейсу за Windows-оригіналом: ядро та egui/eframe-інтерфейс на Rust. Еталон — Windows-код оригіналу 0.1.25. Мови: українська, англійська, російська та системний вибір. Системні мови поза цим набором використовують англійську.
 
 ## Запуск
 
@@ -47,7 +47,7 @@ cargo build --locked --release --bin Cat-Codex-Switcher
 
 У пісочницях, що забороняють DACL, junction або GUI, відповідні тести слід запускати зі звичайного користувацького Windows-сеансу. Тести працюють лише з тимчасовими даними й окремим `rpc-fixture.exe`, який не входить до portable-пакета.
 
-`--self-test` перевіряє сховище на вигаданих credentials у тимчасовій папці. Для машинного результату задайте `CAT_SWITCHER_SELF_TEST_RESULT`. Режим `--ui-fixture` не запускає роботу з акаунтами: `--language uk|en|ru`, `--theme light|dark`, `--scale 1|1.5|2`, `--page accounts|manage|settings|switch|remove`, `--empty`, `--screenshot <path>`, `--quit-after-capture`.
+`--self-test` перевіряє сховище на вигаданих credentials у тимчасовій папці. Для машинного результату задайте `CAT_SWITCHER_SELF_TEST_RESULT`. Режим `--ui-fixture` не запускає роботу з акаунтами: `--language uk|en|ru`, `--theme light|dark`, `--scale 1|1.5|2`, `--page accounts|manage|settings|switch|remove`, `--empty`, `--five-hour`, `--screenshot <path>`, `--quit-after-capture`.
 
 Дивіться `PARITY.md` для матриці функцій і фактичних меж перевірки. Реальний браузерний вхід та handoff слід остаточно перевірити в окремому Windows-профілі з тестовими акаунтами.
 

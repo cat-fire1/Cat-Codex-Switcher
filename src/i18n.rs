@@ -36,9 +36,9 @@ pub fn t<'a>(language: &str, key: &'a str) -> &'a str {
             "Переключение аккаунта",
         ],
         "switch_hint" => [
-            "Codex Desktop закриється та відкриється з вибраним акаунтом. Завершіть поточні завдання перед підтвердженням.",
-            "Codex Desktop will close and reopen with the selected account. Finish current tasks before confirming.",
-            "Codex Desktop закроется и откроется с выбранным аккаунтом. Завершите текущие задачи перед подтверждением.",
+            "Codex Desktop закриється та відкриється знову. Спочатку завершіть або зупиніть завдання Desktop. Якщо з’явиться діалог виходу, підтвердьте його. Якщо Desktop не закриється штатно, перемикання зупиниться. Наявні CLI-сесії залишаться відкритими; нові використають вибраний акаунт.",
+            "Codex Desktop will close and reopen. Finish or stop running Desktop tasks first. If Desktop asks to quit, complete its quit dialog. Switching stops if Desktop cannot exit normally. Existing CLI sessions stay open; new CLI sessions use the selected account.",
+            "Codex Desktop закроется и откроется снова. Сначала завершите или остановите задачи Desktop. Если появится диалог выхода, подтвердите его. Если Desktop не закроется штатно, переключение остановится. Существующие CLI-сессии останутся открытыми; новые используют выбранный аккаунт.",
         ],
         "remove" => ["Видалити", "Remove", "Удалить"],
         "remove_hint" => [
@@ -54,13 +54,9 @@ pub fn t<'a>(language: &str, key: &'a str) -> &'a str {
         "weekly" => ["Тиждень", "Weekly", "Неделя"],
         "five_hour" => ["5 годин", "5 hours", "5 часов"],
         "resets" => ["Скидання", "Resets", "Сброс"],
-        "credits" => [
-            "Додаткові скидання",
-            "Extra resets",
-            "Дополнительные сбросы",
-        ],
+        "credits" => ["Скидань лишилось", "Resets left", "Осталось сбросов"],
         "unknown" => ["Невідомо", "Unknown", "Неизвестно"],
-        "subscription" => ["Підписка до", "Subscription until", "Подписка до"],
+        "subscription" => ["Дійсний до", "Valid until", "Действует до"],
         "snapshot_hint" => [
             "Дата зі збереженого входу, не поточна перевірка оплати. Перевірено:",
             "Saved login snapshot, not a live billing check. Checked:",
@@ -186,6 +182,19 @@ pub fn t<'a>(language: &str, key: &'a str) -> &'a str {
         ],
         "refresh" => ["Оновлюю ліміти…", "Refreshing usage…", "Обновляю лимиты…"],
         "working" => ["Виконую операцію…", "Working…", "Выполняю операцию…"],
+        "left" => ["% лишилось", "% left", "% осталось"],
+        "back" => ["Назад", "Back", "Назад"],
+        "active" => ["Активний", "Active", "Активный"],
+        "active_unconfirmed" => [
+            "Не вдалося підтвердити активний акаунт",
+            "Active account could not be confirmed",
+            "Не удалось подтвердить активный аккаунт",
+        ],
+        "usage" => ["Ліміт", "Usage", "Лимит"],
+        "version" => ["Версія", "Version", "Версия"],
+        "switch_action" => ["Перемкнути", "Switch", "Переключить"],
+        "switch_title" => ["Перемкнути на %@?", "Switch to %@?", "Переключить на %@?"],
+        "remove_title" => ["Видалити %@?", "Remove %@?", "Удалить %@?"],
         _ => return key,
     };
     words[match language {

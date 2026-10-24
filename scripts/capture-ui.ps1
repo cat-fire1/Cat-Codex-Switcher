@@ -10,20 +10,23 @@ $cases = @()
 foreach ($language in @('uk', 'en', 'ru')) {
     foreach ($theme in @('light', 'dark')) {
         foreach ($scale in @('1', '1.5', '2')) {
-            $cases += @{ language=$language; theme=$theme; scale=$scale; page='accounts'; empty=$false }
+            $cases += @{ language=$language; theme=$theme; scale=$scale; page='accounts'; empty=$false; five=$false }
         }
     }
     foreach ($page in @('settings', 'manage', 'switch', 'remove')) {
-        $cases += @{ language=$language; theme='dark'; scale='1.5'; page=$page; empty=$false }
+        $cases += @{ language=$language; theme='dark'; scale='1.5'; page=$page; empty=$false; five=$false }
     }
 }
+foreach ($language in @('uk','en','ru')) { foreach ($theme in @('light','dark')) { $cases += @{ language=$language; theme=$theme; scale='1.5'; page='accounts'; empty=$false; five=$true } } }
 foreach ($theme in @('light','dark')) { $cases += @{ language='uk'; theme=$theme; scale='1'; page='accounts'; empty=$true } }
 foreach ($case in $cases) {
     $suffix = if ($case.empty) { '-empty' } else { '' }
+    if ($case.five) { $suffix += '-five-hour' }
     $name = "$($case.language)-$($case.theme)-$($case.scale)-$($case.page)$suffix.png"
     $destination = Join-Path $Output $name
     $arguments = @('--ui-fixture','--language',$case.language,'--theme',$case.theme,'--scale',$case.scale,'--page',$case.page,'--screenshot',('"' + $destination + '"'),'--quit-after-capture')
     if ($case.empty) { $arguments += '--empty' }
+    if ($case.five) { $arguments += '--five-hour' }
     $process = Start-Process -FilePath $Executable -ArgumentList $arguments -WindowStyle Hidden -PassThru
     if (!$process.WaitForExit(20000)) { Stop-Process -Id $process.Id; throw "Screenshot fixture timed out: $name" }
     if ($process.ExitCode -ne 0 -or !(Test-Path -LiteralPath $destination)) { throw "Screenshot fixture failed: $name" }
