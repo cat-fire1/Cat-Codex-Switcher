@@ -146,6 +146,11 @@ impl Store {
         );
         // Validate the complete tree before publishing the removal.
         platform::check_path(&self.home(id))?;
+        let credential = if self.credential(id).exists() {
+            Some(platform::read(&self.credential(id))?)
+        } else {
+            None
+        };
         let original = self.registry.clone();
         let mut r = original.clone();
         r.accounts.retain(|p| p.id != id);
@@ -153,10 +158,16 @@ impl Store {
         if self.home(id).exists()
             && let Err(removal) = platform::remove_tree(&self.home(id), &self.root)
         {
-            return match self.save_registry(original) {
+            let restore = (|| -> Result<()> {
+                if let Some(bytes) = credential {
+                    platform::atomic_write(&self.credential(id), &bytes)?;
+                }
+                self.save_registry(original)
+            })();
+            return match restore {
                 Ok(()) => Err(removal),
                 Err(restore) => Err(anyhow::anyhow!(
-                    "{removal}; restoring account list also failed: {restore}"
+                    "{removal}; restoring account also failed: {restore}"
                 )),
             };
         }
@@ -557,6 +568,58 @@ mod tests {
         platform::atomic_write(&store.credential(profile.id), &bytes).unwrap();
         store.add(profile.clone()).unwrap();
         profile
+    }
+
+    #[test]
+    fn failed_removal_restores_credentials_before_restoring_the_profile() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("switcher-removal-{}", Uuid::new_v4()));
+        let mut store = Store::load(root.join("store"), root.join("active")).unwrap();
+        let active = br#"{"tokens":{"account_id":"active"}}"#;
+        platform::atomic_write(&store.active_file(), active).unwrap();
+        store.sync_current().unwrap();
+        let profile = saved_account(&mut store, "inactive");
+        let credential = platform::read(&store.credential(profile.id)).unwrap();
+        let registry = platform::read(&store.root.join("accounts.json")).unwrap();
+        let deleted_first = store.home(profile.id).join("aaa-runtime-data");
+        fs::write(&deleted_first, b"disposable data").unwrap();
+        let locked_path = store.home(profile.id).join("zzz-locked-runtime-data");
+        fs::write(&locked_path, b"locked data").unwrap();
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
+            .open(&locked_path)
+            .unwrap();
+        assert!(store.remove(profile.id).is_err());
+        assert!(
+            !deleted_first.exists(),
+            "The deletion must have partially completed"
+        );
+        assert_eq!(
+            platform::read(&store.credential(profile.id)).unwrap(),
+            credential
+        );
+        assert_eq!(
+            platform::read(&store.root.join("accounts.json")).unwrap(),
+            registry
+        );
+        assert_eq!(platform::read(&store.active_file()).unwrap(), active);
+        let reloaded = Store::load(store.root.clone(), store.active.clone()).unwrap();
+        assert!(
+            reloaded
+                .registry
+                .accounts
+                .iter()
+                .any(|p| p.id == profile.id)
+        );
+        drop(locked);
+        store.remove(profile.id).unwrap();
+        assert!(!store.home(profile.id).exists());
+        assert!(!store.registry.accounts.iter().any(|p| p.id == profile.id));
+        platform::remove_tree(&root, &temp).unwrap();
     }
 
     #[test]
