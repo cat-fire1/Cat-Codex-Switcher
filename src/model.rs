@@ -285,3 +285,167 @@ fn service_date(v: &Value) -> Option<DateTime<Utc>> {
     let nanos = ((seconds - whole) * 1_000_000_000.0).floor() as u32;
     DateTime::from_timestamp(whole as i64, nanos)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn window(minutes: i64, used: f64, reset: f64) -> Value {
+        json!({"windowDurationMins": minutes, "usedPercent": used, "resetsAt": reset})
+    }
+
+    #[test]
+    fn usage_selects_windows_by_duration_and_prefers_the_codex_bucket() {
+        let five = window(300, 12.25, 1_800_000_000.25);
+        let weekly = window(10080, 73.6, 1_800_100_000.5);
+        for (primary, secondary) in [(five.clone(), weekly.clone()), (weekly, five)] {
+            let usage = normalize(&json!({
+                "rateLimitsByLimitId": {"codex": {"primary": primary, "secondary": secondary}},
+                "rateLimits": {"primary": window(10080, 99.0, 1.0)}
+            }))
+            .unwrap();
+            assert_eq!(usage.remaining_percent, 26);
+            assert_eq!(usage.five_hour_remaining_percent, Some(88));
+            assert_eq!(
+                usage.resets_at,
+                DateTime::from_timestamp(1_800_100_000, 500_000_000).unwrap()
+            );
+            assert_eq!(
+                usage.five_hour_resets_at,
+                DateTime::from_timestamp(1_800_000_000, 250_000_000)
+            );
+        }
+        let usage = normalize(&json!({"rateLimits": {
+            "primary": {"durationMinutes": 10080, "usedPercent": -5, "resetsAt": 1},
+            "secondary": window(299, 30.0, 2.0)
+        }}))
+        .unwrap();
+        assert_eq!(usage.remaining_percent, 100);
+        assert!(usage.five_hour_remaining_percent.is_none());
+        assert!(usage.five_hour_resets_at.is_none());
+        assert_eq!(
+            normalize(&json!({"rateLimits": {"primary": window(10080, 120.0, 1.0)}}))
+                .unwrap()
+                .remaining_percent,
+            0
+        );
+    }
+
+    #[test]
+    fn usage_rejects_missing_or_invalid_weekly_windows() {
+        for bucket in [
+            Value::Null,
+            json!({"primary": window(300, 10.0, 1.0)}),
+            json!({"primary": window(10080, 10.0, 1e30)}),
+            json!({"primary": {"windowDurationMins": 10080, "usedPercent": "bad", "resetsAt": 1}}),
+        ] {
+            assert_eq!(
+                normalize(&json!({"rateLimits": bucket}))
+                    .unwrap_err()
+                    .to_string(),
+                "Weekly usage unavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_credits_preserve_unknown_counts_and_validate_details() {
+        let mut response = json!({"rateLimits": {"primary": window(10080, 30.0, 1.0)}});
+        let unknown = normalize(&response).unwrap();
+        assert!(unknown.reset_credits_remaining.is_none());
+        assert!(unknown.reset_credits.is_none());
+        for count in [Value::Null, json!(-1), json!("bad")] {
+            response["rateLimitResetCredits"] = json!({"availableCount": count, "credits": null});
+            let usage = normalize(&response).unwrap();
+            assert!(usage.reset_credits_remaining.is_none());
+            assert!(usage.reset_credits.is_none());
+        }
+        response["rateLimitResetCredits"] = json!({"availableCount": 0, "credits": []});
+        let empty = normalize(&response).unwrap();
+        assert_eq!(empty.reset_credits_remaining, Some(0));
+        assert!(empty.reset_credits.unwrap().is_empty());
+        let credit = json!({"id":"credit-1", "status":"available", "resetType":"codexRateLimits", "expiresAt": 1_800_000_000.25});
+        response["rateLimitResetCredits"] =
+            json!({"availableCount": 3, "credits": [credit.clone()]});
+        let usage = normalize(&response).unwrap();
+        assert_eq!(usage.reset_credits_remaining, Some(3));
+        let details = usage.reset_credits.unwrap();
+        assert_eq!(details[0].id, "credit-1");
+        assert_eq!(
+            details[0].expires_at,
+            DateTime::from_timestamp(1_800_000_000, 250_000_000)
+        );
+        let mut invalid_credit = credit;
+        invalid_credit["expiresAt"] = json!("bad");
+        for details in [json!({}), json!([{}]), json!([invalid_credit])] {
+            response["rateLimitResetCredits"]["credits"] = details;
+            assert!(normalize(&response).is_err());
+        }
+    }
+
+    fn credential(account: &str) -> Value {
+        let payload = json!({
+            "email": "Person@example.test",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account, "chatgpt_plan_type": "plus",
+                "chatgpt_subscription_active_until": "2026-11-01T12:00:00Z",
+                "chatgpt_subscription_last_checked": "2026-10-25T10:00:00Z"
+            }
+        });
+        // Synthetic unsigned JWT: these tests check local claims, not authentication.
+        json!({"tokens": {"id_token": format!("e30.{}.fake", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap()))}})
+    }
+
+    #[test]
+    fn jwt_claims_supply_identity_and_keep_workspaces_separate() {
+        let auth = credential("workspace-one");
+        let bytes = serde_json::to_vec(&auth).unwrap();
+        let first = identity(&bytes).unwrap();
+        assert_eq!(first.account_id.as_deref(), Some("workspace-one"));
+        assert_eq!(first.email.as_deref(), Some("Person@example.test"));
+        let mut profile = first.profile();
+        profile.email = Some("person@EXAMPLE.test".into());
+        assert!(first.matches(&profile));
+        let second = identity(&serde_json::to_vec(&credential("workspace-two")).unwrap()).unwrap();
+        assert!(!second.matches(&profile));
+        let dates = subscription(&bytes, &profile).unwrap();
+        assert_eq!(
+            dates.0,
+            "2026-11-01T12:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        assert_eq!(
+            dates.1,
+            "2026-10-25T10:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        profile.account_id = second.account_id;
+        assert!(subscription(&bytes, &profile).is_none());
+        let mut explicit = auth;
+        explicit["tokens"]["account_id"] = json!("explicit-workspace");
+        let bytes = serde_json::to_vec(&explicit).unwrap();
+        let actual = identity(&bytes).unwrap();
+        assert_eq!(actual.account_id.as_deref(), Some("explicit-workspace"));
+        assert!(subscription(&bytes, &actual.profile()).is_none());
+    }
+
+    #[test]
+    fn malformed_jwts_fail_without_leaking_credential_contents() {
+        for token in ["fake-secret", "a.%%%.c", "a.bm90LWpzb24.c", "a.e30.c.extra"] {
+            let mut auth = json!({"tokens": {"id_token": token}});
+            assert!(claims(&auth).is_none());
+            let error = identity(&serde_json::to_vec(&auth).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "Credential identity unavailable");
+            auth["tokens"]["account_id"] = json!("explicit-workspace");
+            let bytes = serde_json::to_vec(&auth).unwrap();
+            let actual = identity(&bytes).unwrap();
+            assert!(actual.email.is_none());
+            assert!(subscription(&bytes, &actual.profile()).is_none());
+        }
+        assert_eq!(
+            identity(br#"{"fake-secret":"#).unwrap_err().to_string(),
+            "Invalid credential JSON"
+        );
+    }
+}
