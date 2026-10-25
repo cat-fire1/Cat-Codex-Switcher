@@ -9,7 +9,7 @@ use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -375,6 +375,23 @@ impl Engine {
         Ok(())
     }
     fn refresh(&mut self) {
+        let exe = rpc::locate();
+        self.refresh_with(|rt, home, token| match &exe {
+            Ok(exe) => rt.block_on(async {
+                let mut session = rpc::Session::start(exe, home, token).await?;
+                let result = session.usage().await;
+                session.stop().await;
+                result
+            }),
+            Err(_) => Err(anyhow::anyhow!(
+                "Codex runtime not found. Set CODEX_CLI_PATH."
+            )),
+        });
+    }
+    fn refresh_with(
+        &mut self,
+        mut read_usage: impl FnMut(&tokio::runtime::Runtime, &Path, Arc<AtomicBool>) -> Result<Usage>,
+    ) {
         let _original = match platform::OriginalGuard::default_location() {
             Ok(g) => g,
             Err(e) => {
@@ -389,24 +406,22 @@ impl Engine {
         }
         self.state.stage = "refresh".into();
         self.publish();
-        let exe = rpc::locate();
         for profile in self.store.registry.accounts.clone() {
             if self.token.load(Ordering::SeqCst) {
                 break;
             }
-            let result = match &exe {
-                Ok(exe) => self.rt.block_on(async {
-                    let mut session =
-                        rpc::Session::start(exe, &self.store.home(profile.id), self.token.clone())
-                            .await?;
-                    let result = session.usage().await;
-                    session.stop().await;
-                    result
-                }),
-                Err(_) => Err(anyhow::anyhow!(
-                    "Codex runtime not found. Set CODEX_CLI_PATH."
-                )),
+            let active = self.store.registry.active_account_id == Some(profile.id)
+                && self.store.verify(profile.id).is_ok();
+            let home = if active {
+                self.store.active.clone()
+            } else {
+                self.store.home(profile.id)
             };
+            let result = read_usage(&self.rt, &home, self.token.clone());
+            // Preserve rotated tokens even when the read fails or is cancelled.
+            if active && let Err(e) = self.store.save_current(Some(profile.id)) {
+                self.state.error = Some(format!("{e:#}"));
+            }
             if self.token.load(Ordering::SeqCst) {
                 break;
             }
@@ -473,6 +488,96 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_preserves_rotated_tokens_on_success_failure_and_cancellation() {
+        if std::env::var_os("SWITCHER_TOKEN_TEST_CHILD").is_none() {
+            let isolated = std::env::temp_dir().join(Uuid::new_v4().to_string());
+            let status = platform::hidden_command(std::env::current_exe().unwrap())
+                .args(["--exact", "worker::tests::refresh_preserves_rotated_tokens_on_success_failure_and_cancellation"])
+                .env("SWITCHER_TOKEN_TEST_CHILD", "1")
+                .env("CODEX_SWITCHER_DATA_HOME", isolated).status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let temp = std::env::temp_dir();
+        for (invalid_active, failed_read, cancelled) in [
+            (false, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, false, false),
+        ] {
+            let root = temp.join(format!("switcher-tokens-{}", Uuid::new_v4()));
+            let mut store = Store::load(root.join("store"), root.join("active")).unwrap();
+            let old = br#"{"tokens":{"account_id":"active","refresh_token":"old-fake"}}"#;
+            let new = br#"{"tokens":{"account_id":"active","refresh_token":"new-fake"}}"#;
+            let other = br#"{"tokens":{"account_id":"inactive"}}"#;
+            platform::atomic_write(&store.active_file(), old).unwrap();
+            store.sync_current().unwrap();
+            let id = store.registry.active_account_id.unwrap();
+            let inactive = identity(other).unwrap().profile();
+            let inactive_home = store.home(inactive.id);
+            platform::atomic_write(&store.credential(inactive.id), other).unwrap();
+            store.add(inactive.clone()).unwrap();
+            if invalid_active {
+                platform::atomic_write(&store.active_file(), b"invalid JSON").unwrap();
+            }
+            let expected_home = if invalid_active {
+                store.home(id)
+            } else {
+                store.active.clone()
+            };
+            let mut engine = Engine {
+                store,
+                state: Snapshot::default(),
+                errors: HashMap::new(),
+                fresh: HashSet::new(),
+                experiment: None,
+                shared: Arc::new(Mutex::new(Snapshot::default())),
+                ctx: egui::Context::default(),
+                token: Arc::new(AtomicBool::new(false)),
+                rt: tokio::runtime::Runtime::new().unwrap(),
+            };
+            let mut homes = Vec::new();
+            engine.refresh_with(|_, home, token| {
+                homes.push(home.to_owned());
+                if home == expected_home {
+                    platform::atomic_write(&home.join("auth.json"), new).unwrap();
+                    token.store(cancelled, Ordering::SeqCst);
+                    ensure!(!failed_read, "Simulated usage failure after token rotation");
+                } else {
+                    assert_eq!(home, inactive_home);
+                }
+                Ok(Usage {
+                    remaining_percent: 42,
+                    resets_at: Utc::now(),
+                    five_hour_remaining_percent: None,
+                    five_hour_resets_at: None,
+                    reset_credits_remaining: None,
+                    reset_credits: None,
+                })
+            });
+            assert_eq!(homes[0], expected_home);
+            assert_eq!(homes.len(), if cancelled { 1 } else { 2 });
+            assert_eq!(platform::read(&engine.store.credential(id)).unwrap(), new);
+            assert_eq!(
+                platform::read(&engine.store.credential(inactive.id)).unwrap(),
+                other
+            );
+            if invalid_active {
+                assert_eq!(
+                    platform::read(&engine.store.active_file()).unwrap(),
+                    b"invalid JSON"
+                );
+            } else {
+                assert_eq!(platform::read(&engine.store.active_file()).unwrap(), new);
+                engine.store.sync_current().unwrap();
+                assert_eq!(platform::read(&engine.store.credential(id)).unwrap(), new);
+            }
+            drop(engine);
+            platform::remove_tree(&root, &temp).unwrap();
+        }
+    }
 
     #[test]
     fn cached_usage_is_stale_until_refreshed_in_this_run() {
