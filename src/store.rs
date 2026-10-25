@@ -1,11 +1,13 @@
-use crate::{model::*, platform};
+use crate::{model::*, platform, rpc};
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use serde::{Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, atomic::AtomicBool},
 };
 use uuid::Uuid;
 
@@ -16,11 +18,12 @@ pub struct Store {
     pub settings: Settings,
     pub cache: Cache,
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ImportPreview {
     pub titles: Vec<String>,
     pub duplicates: usize,
     pub source: PathBuf,
+    fingerprint: [u8; 32],
 }
 struct ImportData {
     registry: Registry,
@@ -281,6 +284,9 @@ impl Store {
     pub fn preview(&self, source: &Path) -> Result<ImportPreview> {
         let _original = platform::OriginalGuard::acquire(source)?;
         let data = self.import_data(source)?;
+        self.preview_data(source, &data)
+    }
+    fn preview_data(&self, source: &Path, data: &ImportData) -> Result<ImportPreview> {
         let mut titles = Vec::new();
         let mut duplicates = 0;
         for p in &data.registry.accounts {
@@ -298,11 +304,23 @@ impl Store {
             titles,
             duplicates,
             source: source.to_owned(),
+            fingerprint: Sha256::digest(serde_json::to_vec(&(
+                &data.registry,
+                &data.settings,
+                &data.cache,
+                &data.credentials,
+            ))?)
+            .into(),
         })
     }
-    pub fn import(&mut self, source: &Path) -> Result<usize> {
+    pub fn import(&mut self, preview: &ImportPreview) -> Result<usize> {
+        let source = &preview.source;
         let _original = platform::OriginalGuard::acquire(source)?;
         let data = self.import_data(source)?;
+        ensure!(
+            self.preview_data(source, &data)? == *preview,
+            "Import source changed. Preview it again before confirming."
+        );
         let mut registry = self.registry.clone();
         let mut cache = self.cache.clone();
         let mut installed = Vec::new();
@@ -460,7 +478,12 @@ pub fn handoff(h: &mut impl Handoff) -> Result<()> {
     h.reopen()
         .context("Account switched; reopenDesktop failed. Open Desktop manually.")
 }
-pub fn switch(store: &mut Store, target: Uuid) -> Result<()> {
+pub fn switch(
+    store: &mut Store,
+    target: Uuid,
+    rt: &tokio::runtime::Runtime,
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
     ensure!(
         store.registry.accounts.iter().any(|p| p.id == target),
         "Target account missing"
@@ -472,6 +495,8 @@ pub fn switch(store: &mut Store, target: Uuid) -> Result<()> {
         target: Uuid,
         original: Option<Uuid>,
         desktop: platform::Desktop,
+        rt: &'a tokio::runtime::Runtime,
+        cancel: Arc<AtomicBool>,
     }
     impl Handoff for Operation<'_> {
         fn close(&mut self) -> Result<()> {
@@ -481,6 +506,20 @@ pub fn switch(store: &mut Store, target: Uuid) -> Result<()> {
             self.store.save_current(self.original)
         }
         fn activate(&mut self) -> Result<()> {
+            let profile = self
+                .store
+                .registry
+                .accounts
+                .iter()
+                .find(|p| p.id == self.target)
+                .context("Target account missing")?;
+            // Refresh the saved home so failed verification retains any rotated tokens.
+            self.rt.block_on(rpc::verify_login(
+                &rpc::locate()?,
+                &self.store.home(self.target),
+                profile,
+                self.cancel.clone(),
+            ))?;
             self.store.activate(self.target)
         }
         fn verify(&mut self) -> Result<()> {
@@ -501,12 +540,134 @@ pub fn switch(store: &mut Store, target: Uuid) -> Result<()> {
         target,
         original,
         desktop,
+        rt,
+        cancel,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn saved_account(store: &mut Store, account_id: &str) -> Profile {
+        let bytes =
+            serde_json::to_vec(&serde_json::json!({"tokens":{"account_id":account_id}})).unwrap();
+        let mut profile = identity(&bytes).unwrap().profile();
+        profile.display_name = "Same name".into();
+        platform::atomic_write(&store.credential(profile.id), &bytes).unwrap();
+        store.add(profile.clone()).unwrap();
+        profile
+    }
+
+    #[test]
+    fn import_rejects_changed_identity_with_the_same_title() {
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("switcher-import-{}", Uuid::new_v4()));
+        let mut destination = Store::load(root.join("destination"), root.join("active")).unwrap();
+        let mut source = Store::load(root.join("source"), root.join("unused")).unwrap();
+        let mut profile = saved_account(&mut source, "workspace-one");
+        let preview = destination.preview(&source.root).unwrap();
+        profile.account_id = Some("workspace-two".into());
+        platform::atomic_write(
+            &source.credential(profile.id),
+            br#"{"tokens":{"account_id":"workspace-two"}}"#,
+        )
+        .unwrap();
+        let mut registry = source.registry.clone();
+        registry.accounts = vec![profile.clone()];
+        source.save_registry(registry).unwrap();
+        let updated = destination.preview(&source.root).unwrap();
+        assert_eq!(preview.titles, updated.titles);
+        assert_eq!(preview.duplicates, updated.duplicates);
+        assert!(
+            destination
+                .import(&preview)
+                .unwrap_err()
+                .to_string()
+                .contains("source changed")
+        );
+        assert!(destination.registry.accounts.is_empty());
+        assert!(!destination.home(profile.id).exists());
+        assert_eq!(destination.import(&updated).unwrap(), 1);
+        assert_eq!(
+            destination.registry.accounts[0].account_id,
+            profile.account_id
+        );
+        assert!(!destination.active_file().exists());
+        platform::remove_tree(&root, &temp).unwrap();
+    }
+
+    #[test]
+    fn import_restores_files_when_the_final_registry_write_fails() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("switcher-import-{}", Uuid::new_v4()));
+        let mut destination = Store::load(root.join("destination"), root.join("active")).unwrap();
+        let mut source = Store::load(root.join("source"), root.join("unused")).unwrap();
+        let active = br#"{"tokens":{"account_id":"original"}}"#;
+        platform::atomic_write(&destination.active_file(), active).unwrap();
+        destination.sync_current().unwrap();
+        destination.save_settings(Settings::default()).unwrap();
+        write(
+            &destination.root.join("usage-cache.json"),
+            &destination.cache,
+        )
+        .unwrap();
+        let imported = saved_account(&mut source, "imported");
+        let mut settings = source.settings.clone();
+        settings.language = "en".into();
+        source.save_settings(settings).unwrap();
+        source
+            .cache(
+                imported.id,
+                Usage {
+                    remaining_percent: 23,
+                    resets_at: Utc::now(),
+                    five_hour_remaining_percent: None,
+                    five_hour_resets_at: None,
+                    reset_credits_remaining: None,
+                    reset_credits: None,
+                },
+            )
+            .unwrap();
+        let preview = destination.preview(&source.root).unwrap();
+        let paths = ["accounts.json", "settings.json", "usage-cache.json"];
+        let before: Vec<_> = paths
+            .iter()
+            .map(|name| platform::read(&destination.root.join(name)).unwrap())
+            .collect();
+        let source_before = platform::read(&source.credential(imported.id)).unwrap();
+        // Denying delete-sharing allows reads but makes atomic replacement fail at commit.
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
+            .open(destination.root.join("accounts.json"))
+            .unwrap();
+        assert!(destination.import(&preview).is_err());
+        drop(locked);
+        for (name, bytes) in paths.iter().zip(before) {
+            assert_eq!(platform::read(&destination.root.join(name)).unwrap(), bytes);
+        }
+        assert_eq!(platform::read(&destination.active_file()).unwrap(), active);
+        assert_eq!(
+            platform::read(&source.credential(imported.id)).unwrap(),
+            source_before
+        );
+        assert!(!destination.home(imported.id).exists());
+        assert_eq!(destination.settings.language, "uk");
+        assert!(destination.cache.entries.is_empty());
+        let reloaded = Store::load(destination.root.clone(), destination.active.clone()).unwrap();
+        assert_eq!(reloaded.registry.accounts.len(), 1);
+        assert_eq!(
+            reloaded.registry.active_account_id,
+            destination.registry.active_account_id
+        );
+        // The same preview remains usable after the transient write failure is gone.
+        assert_eq!(destination.import(&preview).unwrap(), 1);
+        platform::remove_tree(&root, &temp).unwrap();
+    }
 
     #[derive(Default)]
     struct FakeHandoff {

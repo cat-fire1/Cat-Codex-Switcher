@@ -8,7 +8,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -24,6 +24,7 @@ pub struct Row {
     pub profile: Profile,
     pub usage: Option<Usage>,
     pub stale: bool,
+    pub fetched_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
     pub subscription: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
@@ -92,6 +93,7 @@ impl Worker {
                     store,
                     state: Snapshot::default(),
                     errors: HashMap::new(),
+                    fresh: HashSet::new(),
                     experiment: None,
                     shared: shared.clone(),
                     ctx: ctx.clone(),
@@ -196,6 +198,7 @@ struct Engine {
     store: Store,
     state: Snapshot,
     errors: HashMap<Uuid, String>,
+    fresh: HashSet<Uuid>,
     experiment: Option<Experiment>,
     shared: Arc<Mutex<Snapshot>>,
     ctx: egui::Context,
@@ -215,6 +218,12 @@ impl Engine {
             .accounts
             .iter()
             .map(|p| {
+                let cached = self
+                    .store
+                    .cache
+                    .entries
+                    .iter()
+                    .find(|e| e.profile_id == p.id);
                 let path = if Some(p.id) == self.state.active {
                     self.store.active_file()
                 } else {
@@ -222,14 +231,13 @@ impl Engine {
                 };
                 Row {
                     profile: p.clone(),
-                    usage: self
-                        .store
-                        .cache
-                        .entries
-                        .iter()
-                        .find(|e| e.profile_id == p.id)
-                        .map(|e| e.usage.clone()),
-                    stale: self.errors.contains_key(&p.id),
+                    usage: cached.map(|e| e.usage.clone()),
+                    stale: self.errors.contains_key(&p.id)
+                        || cached.is_some_and(|e| {
+                            !self.fresh.contains(&p.id)
+                                || Utc::now() - e.fetched_at >= chrono::Duration::minutes(5)
+                        }),
+                    fetched_at: cached.map(|e| e.fetched_at),
                     error: self.errors.get(&p.id).cloned(),
                     subscription: platform::read(&path).ok().and_then(|b| subscription(&b, p)),
                 }
@@ -298,7 +306,7 @@ impl Engine {
                 if self.store.registry.active_account_id != Some(id) {
                     self.state.stage = "switch".into();
                     self.publish();
-                    let result = store::switch(&mut self.store, id);
+                    let result = store::switch(&mut self.store, id, &self.rt, self.token.clone());
                     self.publish();
                     result?;
                 }
@@ -308,6 +316,7 @@ impl Engine {
                 self.store.sync_current()?;
                 self.store.remove(id)?;
                 self.errors.remove(&id);
+                self.fresh.remove(&id);
             }
             Command::Settings(s) => {
                 updates::repository(&s.update_repository)?;
@@ -346,14 +355,12 @@ impl Engine {
                     .preview
                     .as_ref()
                     .context("Preview the import before confirming")?;
-                let current = self.store.preview(&path)?;
                 ensure!(
-                    previous.source == path
-                        && previous.titles == current.titles
-                        && previous.duplicates == current.duplicates,
-                    "Import source changed. Preview it again before confirming."
+                    previous.source == path,
+                    "Import path changed. Preview it again before confirming."
                 );
-                self.store.import(&path)?;
+                self.store.import(previous)?;
+                self.fresh.clear();
                 self.state.preview = None;
                 self.reset_experiment("resumed")?;
                 self.refresh();
@@ -407,7 +414,10 @@ impl Engine {
                 Ok(usage) => {
                     self.errors.remove(&profile.id);
                     if let Err(e) = self.store.cache(profile.id, usage.clone()) {
+                        self.fresh.remove(&profile.id);
                         self.state.error = Some(format!("{e:#}"));
+                    } else {
+                        self.fresh.insert(profile.id);
                     }
                     (Some(usage), None)
                 }
@@ -463,6 +473,74 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_usage_is_stale_until_refreshed_in_this_run() {
+        let profile = Identity {
+            account_id: Some("saved-id".into()),
+            email: None,
+        }
+        .profile();
+        let id = profile.id;
+        let fetched_at = Utc::now();
+        let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let mut engine = Engine {
+            store: Store {
+                root: root.join("store"),
+                active: root.join("active"),
+                registry: Registry {
+                    accounts: vec![profile],
+                    active_account_id: Some(id),
+                    ..Default::default()
+                },
+                settings: Settings::default(),
+                cache: Cache {
+                    entries: vec![CacheEntry {
+                        profile_id: id,
+                        fetched_at,
+                        usage: Usage {
+                            remaining_percent: 42,
+                            resets_at: fetched_at,
+                            five_hour_remaining_percent: None,
+                            five_hour_resets_at: None,
+                            reset_credits_remaining: None,
+                            reset_credits: None,
+                        },
+                    }],
+                    ..Default::default()
+                },
+            },
+            state: Snapshot::default(),
+            errors: HashMap::new(),
+            fresh: HashSet::new(),
+            experiment: None,
+            shared: Arc::new(Mutex::new(Snapshot::default())),
+            ctx: egui::Context::default(),
+            token: Arc::new(AtomicBool::new(false)),
+            rt: tokio::runtime::Runtime::new().unwrap(),
+        };
+        engine.publish();
+        assert!(engine.state.rows[0].stale);
+        assert_eq!(engine.state.rows[0].fetched_at, Some(fetched_at));
+        engine.fresh.insert(id);
+        engine.publish();
+        assert!(!engine.state.rows[0].stale);
+        engine.store.cache.entries[0].fetched_at -= chrono::Duration::minutes(6);
+        engine.publish();
+        assert!(engine.state.rows[0].stale);
+        engine.store.cache.entries[0].fetched_at = fetched_at;
+        engine.errors.insert(id, "Refresh failed".into());
+        engine.publish();
+        assert!(engine.state.rows[0].stale);
+        assert_eq!(
+            engine.state.rows[0]
+                .usage
+                .as_ref()
+                .unwrap()
+                .remaining_percent,
+            42
+        );
+    }
 
     #[test]
     fn invalid_active_login_still_refreshes_saved_profiles() {
@@ -522,6 +600,7 @@ mod tests {
             store,
             state: Snapshot::default(),
             errors: HashMap::new(),
+            fresh: HashSet::new(),
             experiment: None,
             shared: Arc::new(Mutex::new(Snapshot::default())),
             ctx: egui::Context::default(),

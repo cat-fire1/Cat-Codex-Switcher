@@ -1,5 +1,5 @@
 use crate::{
-    model::{self, Identity, Usage},
+    model::{self, Identity, Profile, Usage},
     platform,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -81,6 +81,12 @@ impl Session {
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .creation_flags(0x08000000);
+        Self::start_command(command, cancel).await
+    }
+    async fn start_command(
+        mut command: tokio::process::Command,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Self> {
         let mut child = command
             .spawn()
             .context("Could not start Codex app-server")?;
@@ -196,33 +202,66 @@ impl Session {
             .request("account/read", json!({"refreshToken":false}))
             .await?;
         let local = model::identity(&platform::read(&home.join("auth.json"))?)?;
-        let account = value
-            .get("account")
-            .and_then(Value::as_object)
-            .context("Login identity unavailable")?;
-        if let Some(id) = ["accountId", "accountID", "chatgptAccountId", "id"]
-            .iter()
-            .find_map(|k| account.get(*k).and_then(Value::as_str))
-        {
-            ensure!(
-                local.account_id.as_deref() == Some(id),
-                "Login identity mismatch"
-            );
-        }
-        if let Some(email) = value.pointer("/account/email").and_then(Value::as_str) {
-            ensure!(
-                local
-                    .email
-                    .as_ref()
-                    .is_none_or(|e| e.eq_ignore_ascii_case(email)),
-                "Login identity mismatch"
-            );
-        }
+        verify_account(&value, &local)?;
         Ok(local)
+    }
+    async fn verify_login(&mut self, home: &Path, profile: &Profile) -> Result<()> {
+        let value = self
+            .request("account/read", json!({"refreshToken":true}))
+            .await?;
+        let local = model::identity(&platform::read(&home.join("auth.json"))?)?;
+        ensure!(
+            local.matches(profile),
+            "Target identity verification failed"
+        );
+        verify_account(&value, &local)?;
+        // A live authenticated read must succeed even when this plan has no weekly window.
+        self.request("account/rateLimits/read", json!({})).await?;
+        Ok(())
     }
     pub async fn usage(&mut self) -> Result<Usage> {
         model::normalize(&self.request("account/rateLimits/read", json!({})).await?)
     }
+}
+pub async fn verify_login(
+    exe: &Path,
+    home: &Path,
+    profile: &Profile,
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut session = Session::start(exe, home, cancel).await?;
+    let result = session.verify_login(home, profile).await;
+    session.stop().await;
+    result
+}
+fn verify_account(value: &Value, local: &Identity) -> Result<()> {
+    let account = value
+        .get("account")
+        .and_then(Value::as_object)
+        .context("Login identity unavailable")?;
+    ensure!(
+        account.get("type").and_then(Value::as_str) == Some("chatgpt"),
+        "Expected a ChatGPT login"
+    );
+    if let Some(id) = ["accountId", "accountID", "chatgptAccountId", "id"]
+        .iter()
+        .find_map(|k| account.get(*k).and_then(Value::as_str))
+    {
+        ensure!(
+            local.account_id.as_deref() == Some(id),
+            "Login identity mismatch"
+        );
+    }
+    if let Some(email) = account.get("email").and_then(Value::as_str) {
+        ensure!(
+            local
+                .email
+                .as_ref()
+                .is_none_or(|e| e.eq_ignore_ascii_case(email)),
+            "Login identity mismatch"
+        );
+    }
+    Ok(())
 }
 fn decode(v: Value, response: bool) -> Result<Value> {
     // Remote text may contain credentials. Show a bounded category and numeric code only.
@@ -235,4 +274,116 @@ fn decode(v: Value, response: bool) -> Result<Value> {
     v.get(if response { "result" } else { "params" })
         .cloned()
         .context("Malformed RPC envelope")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verification_refreshes_auth_and_requires_a_live_authenticated_read() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let root = std::env::temp_dir().join(format!("switcher-rpc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let auth = br#"{"tokens":{"account_id":"saved-id","refresh_token":"old-fake-token"}}"#;
+        let profile = model::identity(auth).unwrap().profile();
+        let log = root.join("requests.txt");
+        let script = r#"
+            $ErrorActionPreference = 'Stop'
+            while ($null -ne ($line = [Console]::ReadLine())) {
+                $request = ConvertFrom-Json -InputObject $line
+                if ($null -eq $request.id) { continue }
+                $result = '{}'
+                $failed = $false
+                switch ($request.method) {
+                    'initialize' {}
+                    'account/read' {
+                        if ($request.params.refreshToken -ne $true) { exit 2 }
+                        [IO.File]::AppendAllText($env:SWITCHER_TEST_LOG, "refresh`n")
+                        $failed = $env:SWITCHER_TEST_FAILURE -eq 'refresh'
+                        if (-not $failed) {
+                            [IO.File]::WriteAllText($env:SWITCHER_TEST_AUTH_PATH, $env:SWITCHER_TEST_AUTH)
+                        }
+                        $result = $env:SWITCHER_TEST_ACCOUNT
+                    }
+                    'account/rateLimits/read' {
+                        [IO.File]::AppendAllText($env:SWITCHER_TEST_LOG, "limits`n")
+                        $failed = $env:SWITCHER_TEST_FAILURE -eq 'limits'
+                    }
+                    default { exit 3 }
+                }
+                if ($failed) {
+                    [Console]::WriteLine(('{"id":' + $request.id + ',"error":{"code":401,"message":"fake secret"}}'))
+                } else {
+                    [Console]::WriteLine(('{"id":' + $request.id + ',"result":' + $result + '}'))
+                }
+            }
+        "#;
+        for (account, failure, rotated_id, expected) in [
+            (
+                json!({"type":"chatgpt","id":"saved-id"}),
+                "",
+                "saved-id",
+                true,
+            ),
+            (Value::Null, "", "saved-id", false),
+            (json!({"type":"apiKey"}), "", "saved-id", false),
+            (
+                json!({"type":"chatgpt","id":"other"}),
+                "",
+                "saved-id",
+                false,
+            ),
+            (json!({"type":"chatgpt"}), "", "other", false),
+            (json!({"type":"chatgpt"}), "refresh", "saved-id", false),
+            (json!({"type":"chatgpt"}), "limits", "saved-id", false),
+        ] {
+            std::fs::write(root.join("auth.json"), auth).unwrap();
+            std::fs::write(&log, b"").unwrap();
+            let rotated =
+                json!({"tokens":{"account_id":rotated_id,"refresh_token":"new-fake-token"}});
+            let exe = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+            let mut command = tokio::process::Command::new(exe);
+            command
+                .args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .env("SWITCHER_TEST_LOG", &log)
+                .env("SWITCHER_TEST_AUTH_PATH", root.join("auth.json"))
+                .env("SWITCHER_TEST_AUTH", rotated.to_string())
+                .env(
+                    "SWITCHER_TEST_ACCOUNT",
+                    json!({"account":account}).to_string(),
+                )
+                .env("SWITCHER_TEST_FAILURE", failure)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .creation_flags(0x08000000);
+            let result = rt.block_on(async {
+                let mut session = Session::start_command(command, Arc::new(AtomicBool::new(false)))
+                    .await
+                    .unwrap();
+                let result = session.verify_login(&root, &profile).await;
+                session.stop().await;
+                result
+            });
+            assert_eq!(result.is_ok(), expected, "{account}, {failure}: {result:?}");
+            let requests = std::fs::read_to_string(&log).unwrap();
+            assert!(requests.starts_with("refresh\n"));
+            if expected || failure == "limits" {
+                assert_eq!(requests, "refresh\nlimits\n");
+                assert_eq!(
+                    std::fs::read(root.join("auth.json")).unwrap(),
+                    rotated.to_string().as_bytes()
+                );
+            }
+            if let Err(error) = result {
+                assert!(!format!("{error:#}").contains("fake secret"));
+            }
+        }
+        std::fs::remove_file(root.join("auth.json")).unwrap();
+        std::fs::remove_file(log).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 }

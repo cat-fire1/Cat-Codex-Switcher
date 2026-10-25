@@ -188,10 +188,26 @@ impl Tray {
             None
         };
         let tooltip = if let Some(row) = active {
+            let title: String = row.profile.title().chars().take(32).collect();
             format!(
-                "{}{}",
-                row.profile.title(),
-                percentage.map(|p| format!(" — {p}%")).unwrap_or_default()
+                "{}{}{}",
+                title,
+                percentage.map(|p| format!(" — {p}%")).unwrap_or_default(),
+                if row.stale {
+                    format!(
+                        "{}\n{}",
+                        row.fetched_at
+                            .map(|at| format!(
+                                "\n{}{}",
+                                i18n::t(lang, "usage_checked"),
+                                at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M")
+                            ))
+                            .unwrap_or_default(),
+                        i18n::t(lang, "stale"),
+                    )
+                } else {
+                    String::new()
+                },
             )
         } else {
             "Cat Codex Switcher".into()

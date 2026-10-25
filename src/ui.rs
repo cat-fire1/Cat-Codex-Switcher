@@ -321,6 +321,13 @@ impl App {
                             );
                             ui.painter()
                                 .rect_filled(avatar, 4, p.hover.gamma_multiply(opacity));
+                            if !manage && row.stale && row.usage.is_some() {
+                                ui.painter().circle_filled(
+                                    avatar.right_top() + egui::vec2(-2.0, 2.0),
+                                    3.0,
+                                    Color32::from_rgb(210, 140, 35),
+                                );
+                            }
                             let initials = initials(&row.profile.display_name);
                             ui.painter().text(
                                 avatar.center(),
@@ -452,8 +459,15 @@ impl App {
                             }
                             if row.stale {
                                 response.on_hover_text(format!(
-                                    "{}\n{}",
+                                    "{}\n{}{}\n{}",
                                     i18n::t(lang, "stale"),
+                                    i18n::t(lang, "usage_checked"),
+                                    row.fetched_at
+                                        .map(|at| at
+                                            .with_timezone(&Local)
+                                            .format("%Y-%m-%d %H:%M")
+                                            .to_string())
+                                        .unwrap_or_default(),
                                     row.error.as_deref().unwrap_or("")
                                 ));
                             } else if let Some(error) = &row.error {
