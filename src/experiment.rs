@@ -71,12 +71,25 @@ impl Experiment {
         let mut result = Self::default();
         platform::check_path(path)?;
         if path.exists() {
-            for line in platform::read(path)?
-                .split(|c| *c == b'\n')
-                .filter(|s| !s.is_empty())
-            {
-                let event: Event = serde_json::from_slice(line)
-                    .map_err(|_| anyhow::anyhow!("Invalid experiment log"))?;
+            let bytes = platform::read(path)?;
+            let mut offset = 0;
+            for line in bytes.split_inclusive(|c| *c == b'\n') {
+                let event: Event = match serde_json::from_slice(line) {
+                    Ok(event) => event,
+                    Err(_) if line.iter().all(u8::is_ascii_whitespace) => {
+                        offset += line.len();
+                        continue;
+                    }
+                    Err(e) if !line.ends_with(b"\n") && e.is_eof() => {
+                        // Keep the interrupted tail before repairing the append-only log.
+                        let backup =
+                            path.with_extension(format!("jsonl.corrupt-{}", Uuid::new_v4()));
+                        platform::atomic_write(&backup, line)?;
+                        platform::atomic_write(path, &bytes[..offset])?;
+                        break;
+                    }
+                    Err(_) => anyhow::bail!("Invalid experiment log"),
+                };
                 if let (Some(id), Some(usage)) = (event.profile_id, &event.usage)
                     && usage.reset_credits.is_some()
                 {
@@ -85,6 +98,12 @@ impl Experiment {
                 if let Some(key) = event.key() {
                     result.completed.insert(key);
                 }
+                offset += line.len();
+            }
+            if offset == bytes.len() && !bytes.is_empty() && !bytes.ends_with(b"\n") {
+                let mut terminated = bytes;
+                terminated.push(b'\n');
+                platform::atomic_write(path, &terminated)?;
             }
         }
         Ok(result)
@@ -217,4 +236,69 @@ pub fn append(path: &Path, events: &[Event]) -> Result<()> {
     }
     file.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_tail_is_preserved_and_checkpoints_survive_repair() {
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("switcher-log-{}", Uuid::new_v4()));
+        let path = root.join("experiment.jsonl");
+        let mut event = Event::marker("checkpoint", Utc::now());
+        event.profile_id = Some(Uuid::new_v4());
+        event.credit_id = Some("credit".into());
+        event.expires_at = Some(Utc::now());
+        event.checkpoint_minutes = Some(10);
+        append(&path, &[event.clone()]).unwrap();
+        let prefix = platform::read(&path).unwrap();
+        let tail = br#"{"event":"snapshot","timestamp":"#;
+        let mut interrupted = prefix.clone();
+        interrupted.extend_from_slice(tail);
+        platform::atomic_write(&path, &interrupted).unwrap();
+        let recovered = Experiment::load(&path).unwrap();
+        assert!(recovered.completed.contains(&event.key().unwrap()));
+        assert_eq!(platform::read(&path).unwrap(), prefix);
+        let backup = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p != &path)
+            .unwrap();
+        assert_eq!(platform::read(&backup).unwrap(), tail);
+        append(&path, &[Event::marker("resumed", Utc::now())]).unwrap();
+        assert!(
+            Experiment::load(&path)
+                .unwrap()
+                .completed
+                .contains(&event.key().unwrap())
+        );
+        platform::remove_tree(&root, &temp).unwrap();
+    }
+
+    #[test]
+    fn complete_final_event_gets_a_separator_but_corrupt_complete_lines_are_rejected() {
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("switcher-log-{}", Uuid::new_v4()));
+        let path = root.join("experiment.jsonl");
+        let event = serde_json::to_vec(&Event::marker("enabled", Utc::now())).unwrap();
+        platform::atomic_write(&path, &event).unwrap();
+        Experiment::load(&path).unwrap();
+        append(&path, &[Event::marker("resumed", Utc::now())]).unwrap();
+        let bytes = platform::read(&path).unwrap();
+        assert_eq!(
+            bytes
+                .split(|b| *b == b'\n')
+                .filter(|s| !s.is_empty())
+                .count(),
+            2
+        );
+        Experiment::load(&path).unwrap();
+        let corrupt = b"{broken}\n";
+        platform::atomic_write(&path, corrupt).unwrap();
+        assert!(Experiment::load(&path).is_err());
+        assert_eq!(platform::read(&path).unwrap(), corrupt);
+        platform::remove_tree(&root, &temp).unwrap();
+    }
 }
