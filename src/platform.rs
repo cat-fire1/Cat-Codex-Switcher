@@ -430,6 +430,8 @@ impl Desktop {
         }
     }
     pub fn processes(&self) -> Result<Vec<u32>> {
+        let executable =
+            fs::canonicalize(&self.executable).context("Cannot resolve Desktop executable path")?;
         let mut ids = Vec::new();
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?;
@@ -443,8 +445,7 @@ impl Desktop {
                     let name = String::from_utf16_lossy(&entry.szExeFile)
                         .trim_end_matches('\0')
                         .to_string();
-                    if self
-                        .executable
+                    if executable
                         .file_name()
                         .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(&name))
                     {
@@ -481,10 +482,7 @@ impl Desktop {
                             PWSTR(buffer.as_mut_ptr()),
                             &mut length,
                         );
-                        let mut matches = path_result.is_ok()
-                            && self.executable.to_string_lossy().eq_ignore_ascii_case(
-                                &String::from_utf16_lossy(&buffer[..length as usize]),
-                            );
+                        let mut package_match = None;
                         if let Some(expected) = &self.app_id {
                             let mut size = 0;
                             if GetApplicationUserModelId(handle, &mut size, PWSTR::null())
@@ -497,9 +495,9 @@ impl Desktop {
                                     PWSTR(id.as_mut_ptr()),
                                 ) == ERROR_SUCCESS
                                 {
-                                    matches = expected.eq_ignore_ascii_case(
+                                    package_match = Some(expected.eq_ignore_ascii_case(
                                         String::from_utf16_lossy(&id).trim_end_matches('\0'),
-                                    );
+                                    ));
                                 }
                             }
                         }
@@ -515,6 +513,19 @@ impl Desktop {
                             continue;
                         }
                         path_result.context("Cannot read the live Desktop executable path")?;
+                        let matches = match package_match {
+                            Some(matches) => matches,
+                            None => {
+                                let path = PathBuf::from(String::from_utf16_lossy(
+                                    &buffer[..length as usize],
+                                ));
+                                let actual = fs::canonicalize(path)
+                                    .context("Cannot resolve the live Desktop executable path")?;
+                                executable
+                                    .to_string_lossy()
+                                    .eq_ignore_ascii_case(&actual.to_string_lossy())
+                            }
+                        };
                         if matches {
                             ids.push(entry.th32ProcessID);
                         }
@@ -594,5 +605,65 @@ impl Desktop {
             std::thread::sleep(Duration::from_millis(250));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_process_matching_accepts_equivalent_paths() {
+        let executable = std::env::current_exe().unwrap();
+        // Give relative paths a stable base without changing other test threads' directory.
+        if std::env::var_os("SWITCHER_PATH_TEST_CHILD").is_none() {
+            let status = hidden_command(&executable)
+                .args([
+                    "--exact",
+                    "platform::tests::desktop_process_matching_accepts_equivalent_paths",
+                ])
+                .current_dir(executable.parent().unwrap())
+                .env("SWITCHER_PATH_TEST_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        for path in [
+            executable.clone(),
+            PathBuf::from(executable.to_string_lossy().replace('\\', "/")),
+            fs::canonicalize(&executable).unwrap(),
+            PathBuf::from(executable.file_name().unwrap()),
+            PathBuf::from(".").join(executable.file_name().unwrap()),
+            PathBuf::from("..")
+                .join(executable.parent().unwrap().file_name().unwrap())
+                .join(executable.file_name().unwrap()),
+        ] {
+            let desktop = Desktop {
+                executable: path,
+                app_id: None,
+            };
+            assert!(
+                desktop.processes().unwrap().contains(&std::process::id()),
+                "Could not find this process using {:?}",
+                desktop.executable
+            );
+        }
+        let other = std::env::temp_dir().join(format!("switcher-path-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&other).unwrap();
+        let other_executable = other.join(executable.file_name().unwrap());
+        fs::write(&other_executable, b"Unrelated file with the same name").unwrap();
+        let different = Desktop {
+            executable: other_executable.clone(),
+            app_id: None,
+        };
+        assert!(different.processes().unwrap().is_empty());
+        fs::remove_file(other_executable).unwrap();
+        fs::remove_dir(other).unwrap();
+        let missing = Desktop {
+            executable: executable.with_file_name("missing-desktop.exe"),
+            app_id: None,
+        };
+        assert!(missing.processes().is_err());
     }
 }
