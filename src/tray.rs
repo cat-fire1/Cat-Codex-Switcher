@@ -5,6 +5,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
+use std::time::{Duration, Instant};
 pub struct Shell {
     stop: Arc<AtomicBool>,
     opened: Arc<AtomicBool>,
@@ -75,7 +76,7 @@ impl Shell {
                         }
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(500));
             }
         });
         match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
@@ -116,6 +117,8 @@ pub struct Tray {
     quit: MenuItem,
     actions: Arc<Mutex<Vec<Action>>>,
     last: Option<(Option<i32>, bool, String)>,
+    last_menu: Option<(String, bool)>,
+    theme: (bool, Instant),
 }
 pub enum Action {
     Open,
@@ -128,11 +131,12 @@ impl Tray {
         let quit = MenuItem::new("Quit", true, None);
         menu.append(&open)?;
         menu.append(&quit)?;
+        let dark = platform::taskbar_dark();
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(false)
             .with_tooltip("Cat Codex Switcher")
-            .with_icon(icon(None, platform::taskbar_dark())?)
+            .with_icon(icon(None, dark)?)
             .build()?;
         let actions = Arc::new(Mutex::new(Vec::new()));
         let pending = actions.clone();
@@ -170,11 +174,18 @@ impl Tray {
             quit,
             actions,
             last: None,
+            last_menu: None,
+            theme: (dark, Instant::now()),
         })
     }
     pub fn update(&mut self, s: &Snapshot, lang: &str) -> Result<()> {
-        self.quit.set_text(i18n::t(lang, "quit"));
-        self.quit.set_enabled(!s.busy && !s.adding);
+        let text = i18n::t(lang, "quit").to_owned();
+        let enabled = !s.busy && !s.adding;
+        if self.last_menu.as_ref() != Some(&(text.clone(), enabled)) {
+            self.quit.set_text(text.as_str());
+            self.quit.set_enabled(enabled);
+            self.last_menu = Some((text, enabled));
+        }
         let active = s.rows.iter().find(|r| Some(r.profile.id) == s.active);
         let percentage = if s.settings.shows_menu_bar_percentage {
             active.and_then(|r| r.usage.as_ref()).map(|u| {
@@ -188,7 +199,7 @@ impl Tray {
             None
         };
         let tooltip = if let Some(row) = active {
-            let title: String = row.profile.title().chars().take(32).collect();
+            let title: String = row.title.chars().take(64).collect();
             format!(
                 "{}{}{}",
                 title,
@@ -213,7 +224,14 @@ impl Tray {
             "Cat Codex Switcher".into()
         };
         let tooltip: String = tooltip.chars().take(100).collect();
-        let key = (percentage, platform::taskbar_dark(), tooltip);
+        let dark = if self.theme.1.elapsed() < Duration::from_secs(1) {
+            self.theme.0
+        } else {
+            let dark = platform::taskbar_dark();
+            self.theme = (dark, Instant::now());
+            dark
+        };
+        let key = (percentage, dark, tooltip);
         if self.last.as_ref() != Some(&key) {
             self.icon.set_icon(Some(icon(key.0, key.1)?))?;
             self.icon.set_tooltip(Some(&key.2))?;

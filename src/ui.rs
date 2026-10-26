@@ -187,7 +187,7 @@ impl App {
                                 .rows
                                 .iter()
                                 .find(|r| r.profile.id == id)
-                                .map(|r| r.profile.display_name.as_str())
+                                .map(|r| r.title.as_str())
                                 .unwrap_or("");
                             i18n::t(
                                 lang,
@@ -303,7 +303,7 @@ impl App {
                                     egui::WidgetType::Button,
                                     !self.state.busy,
                                     active,
-                                    row.profile.title(),
+                                    row.title.as_str(),
                                 )
                             });
                             if !manage && response.clicked() && !active && !self.state.busy {
@@ -360,7 +360,7 @@ impl App {
                                             let action_width = if active { 54.0 } else { 38.0 };
                                             win::ellipsis(
                                                 ui,
-                                                row.profile.title(),
+                                                &row.title,
                                                 (detail.width() - action_width - 8.0).max(30.0),
                                                 14.0,
                                                 true,
@@ -405,7 +405,7 @@ impl App {
                                     ui.horizontal(|ui| {
                                         win::ellipsis(
                                             ui,
-                                            row.profile.title(),
+                                            &row.title,
                                             (detail.width() - reset_width).max(30.0),
                                             14.0,
                                             true,
@@ -760,15 +760,15 @@ impl App {
                             })
                             .inner;
                         let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if (confirm.clicked() || enter) && !self.state.busy {
+                        let cancel = win::button(ui, i18n::t(lang, "cancel"), None);
+                        if cancel.clicked() || (enter && cancel.has_focus()) {
+                            self.page = if remove { Page::Manage } else { Page::Accounts };
+                        } else if (confirm.clicked() || enter) && !self.state.busy {
                             self.send(if remove {
                                 Command::Remove(id)
                             } else {
                                 Command::Switch(id)
                             });
-                            self.page = if remove { Page::Manage } else { Page::Accounts };
-                        }
-                        if win::button(ui, i18n::t(lang, "cancel"), None).clicked() {
                             self.page = if remove { Page::Manage } else { Page::Accounts };
                         }
                     });
@@ -810,7 +810,9 @@ impl eframe::App for App {
             }
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.state.adding {
+            if !self.state.busy && self.state.preview.is_some() {
+                self.send(Command::Dismiss);
+            } else if self.state.adding {
                 if let Some(worker) = &self.worker {
                     worker.cancel.store(true, Ordering::SeqCst);
                 }
@@ -822,7 +824,7 @@ impl eframe::App for App {
         let maximum = ctx.input(|i| {
             i.viewport()
                 .monitor_size
-                .map(|s| s.y - 90.0)
+                .map(|s| (s.y - 90.0).max(130.0))
                 .unwrap_or(800.0)
         });
         let panel = egui::CentralPanel::default()
@@ -888,14 +890,29 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(420.0, height)));
         }
         if let Some(preview) = self.state.preview.clone() {
+            let mut open = true;
             egui::Window::new(i18n::t(&lang, "preview"))
+                .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
+                .default_width(360.0)
                 .show(ctx, |ui| {
-                    ui.label(preview.source.display().to_string());
-                    for title in &preview.titles {
-                        ui.label(title);
-                    }
+                    win::ellipsis(
+                        ui,
+                        &preview.source.display().to_string(),
+                        ui.available_width(),
+                        11.0,
+                        false,
+                        true,
+                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt("import-preview-titles")
+                        .max_height((maximum - 240.0).max(90.0))
+                        .show(ui, |ui| {
+                            for title in &preview.titles {
+                                ui.add(egui::Label::new(title.as_str()).wrap());
+                            }
+                        });
                     ui.label(format!(
                         "{}: {}",
                         i18n::t(&lang, "duplicates"),
@@ -917,6 +934,9 @@ impl eframe::App for App {
                         }
                     });
                 });
+            if !open {
+                self.send(Command::Dismiss);
+            }
         }
         ctx.request_repaint_after(Duration::from_millis(400));
     }
@@ -1072,7 +1092,10 @@ fn account_info(ui: &mut egui::Ui, row: &crate::worker::Row, lang: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{atomic::AtomicBool, mpsc};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize},
+        mpsc,
+    };
 
     #[test]
     fn disconnected_worker_does_not_block_quit() {
@@ -1089,6 +1112,7 @@ mod tests {
             worker: Some(Worker {
                 commands,
                 cancel: Arc::new(AtomicBool::new(false)),
+                pending: Arc::new(AtomicUsize::new(0)),
                 join: None,
             }),
             _instance: None,

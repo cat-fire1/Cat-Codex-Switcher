@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -22,6 +22,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct Row {
     pub profile: Profile,
+    pub title: String,
     pub usage: Option<Usage>,
     pub stale: bool,
     pub fetched_at: Option<DateTime<Utc>>,
@@ -39,7 +40,6 @@ pub struct Snapshot {
     pub preview: Option<ImportPreview>,
     pub update_url: Option<String>,
     pub update_status: String,
-    pub stage: String,
 }
 impl Default for Snapshot {
     fn default() -> Self {
@@ -53,7 +53,6 @@ impl Default for Snapshot {
             preview: None,
             update_url: None,
             update_status: String::new(),
-            stage: String::new(),
         }
     }
 }
@@ -73,7 +72,17 @@ pub enum Command {
 pub struct Worker {
     pub commands: mpsc::Sender<Command>,
     pub cancel: Arc<AtomicBool>,
+    pub pending: Arc<AtomicUsize>,
     pub join: Option<std::thread::JoinHandle<()>>,
+}
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_owned()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "unknown panic".into()
+    }
 }
 impl Worker {
     pub fn start(
@@ -84,6 +93,8 @@ impl Worker {
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let queued = pending.clone();
         let token = cancel.clone();
         let join = std::thread::spawn(move || {
             let run = || -> Result<()> {
@@ -95,6 +106,8 @@ impl Worker {
                     errors: HashMap::new(),
                     fresh: HashSet::new(),
                     experiment: None,
+                    refresh_failed: false,
+                    pending: queued,
                     shared: shared.clone(),
                     ctx: ctx.clone(),
                     token,
@@ -104,22 +117,41 @@ impl Worker {
                     engine.experiment = None;
                     engine.state.error = Some(format!("{e:#}"));
                 }
-                engine.state.busy = false;
+                if let Some(warning) = engine.store.warning.clone() {
+                    engine.state.error = Some(match engine.state.error.take() {
+                        Some(existing) => format!("{warning}\n{existing}"),
+                        None => warning,
+                    });
+                }
+                if engine.store.settings.launch_at_login
+                    && let Err(e) = platform::startup(true)
+                {
+                    let message = format!("Could not repair launch-at-login: {e:#}");
+                    engine.state.error = Some(match engine.state.error.take() {
+                        Some(existing) => format!("{existing}\n{message}"),
+                        None => message,
+                    });
+                }
+                engine.state.busy = true;
                 engine.publish();
                 engine.refresh();
                 if engine.store.settings.automatically_check_updates {
                     engine.check_updates();
                 }
+                engine.state.busy = false;
+                engine.publish();
                 let mut next_refresh = Instant::now() + Duration::from_secs(300);
                 let mut next_update = Instant::now() + Duration::from_secs(3600);
                 loop {
                     match rx.recv_timeout(Duration::from_millis(200)) {
                         Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Ok(command) => {
+                            engine.pending.fetch_sub(1, Ordering::SeqCst);
                             engine.token.store(false, Ordering::SeqCst);
                             engine.state.busy = true;
                             if !matches!(command, Command::Dismiss) {
                                 engine.state.error = None;
+                                engine.refresh_failed = false;
                             }
                             engine.publish();
                             let result = engine.command(command);
@@ -130,7 +162,6 @@ impl Worker {
                             }
                             engine.state.busy = false;
                             engine.state.adding = false;
-                            engine.state.stage.clear();
                             engine.publish();
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -149,28 +180,44 @@ impl Worker {
                                     )
                                 })
                                 .is_some_and(|t| t <= Utc::now());
-                            if Instant::now() >= next_refresh || checkpoint {
-                                engine.token.store(false, Ordering::SeqCst);
-                                engine.refresh();
-                                next_refresh = Instant::now() + Duration::from_secs(300);
-                            }
-                            if Instant::now() >= next_update {
-                                if engine.store.settings.automatically_check_updates {
-                                    engine.check_updates();
+                            let refresh_due = Instant::now() >= next_refresh || checkpoint;
+                            let update_due = Instant::now() >= next_update;
+                            if refresh_due || update_due {
+                                engine.state.busy = true;
+                                engine.publish();
+                                if refresh_due {
+                                    engine.token.store(false, Ordering::SeqCst);
+                                    engine.refresh();
+                                    next_refresh = Instant::now() + Duration::from_secs(300);
                                 }
-                                next_update = Instant::now() + Duration::from_secs(3600);
+                                if update_due {
+                                    if engine.store.settings.automatically_check_updates {
+                                        engine.check_updates();
+                                    }
+                                    next_update = Instant::now() + Duration::from_secs(3600);
+                                }
+                                engine.state.busy = false;
+                                engine.publish();
                             }
                         }
                     }
                 }
                 Ok(())
             };
-            if let Err(e) = run() {
+            let error = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(format!("{e:#}")),
+                Err(payload) => Some(format!(
+                    "Background worker crashed: {}",
+                    panic_message(payload)
+                )),
+            };
+            if let Some(error) = error {
                 // Reject commands before publishing an idle state for a stopped worker.
                 drop(rx);
                 let s = Snapshot {
                     busy: false,
-                    error: Some(format!("{e:#}")),
+                    error: Some(error),
                     ..Default::default()
                 };
                 if let Ok(mut latest) = shared.lock() {
@@ -182,6 +229,7 @@ impl Worker {
         Self {
             commands: tx,
             cancel,
+            pending,
             join: Some(join),
         }
     }
@@ -189,9 +237,11 @@ impl Worker {
         if !matches!(command, Command::Dismiss) {
             self.cancel.store(true, Ordering::SeqCst);
         }
-        self.commands
-            .send(command)
-            .map_err(|_| anyhow::anyhow!("Background worker stopped. Restart the application."))
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        self.commands.send(command).map_err(|_| {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+            anyhow::anyhow!("Background worker stopped. Restart the application.")
+        })
     }
 }
 struct Engine {
@@ -200,6 +250,8 @@ struct Engine {
     errors: HashMap<Uuid, String>,
     fresh: HashSet<Uuid>,
     experiment: Option<Experiment>,
+    refresh_failed: bool,
+    pending: Arc<AtomicUsize>,
     shared: Arc<Mutex<Snapshot>>,
     ctx: egui::Context,
     token: Arc<AtomicBool>,
@@ -231,6 +283,7 @@ impl Engine {
                 };
                 Row {
                     profile: p.clone(),
+                    title: self.store.registry.label(p),
                     usage: cached.map(|e| e.usage.clone()),
                     stale: self.errors.contains_key(&p.id)
                         || cached.is_some_and(|e| {
@@ -244,6 +297,7 @@ impl Engine {
             })
             .collect();
         if let Ok(mut latest) = self.shared.lock() {
+            self.state.busy |= self.pending.load(Ordering::SeqCst) > 0;
             *latest = self.state.clone();
         }
         self.ctx.request_repaint();
@@ -271,7 +325,6 @@ impl Engine {
             Command::Add => {
                 self.state.error = None;
                 self.state.adding = true;
-                self.state.stage = "login".into();
                 self.publish();
                 let id = Uuid::new_v4();
                 let home = self.store.home(id);
@@ -289,12 +342,12 @@ impl Engine {
                     profile.id = id;
                     self.store.add(profile)
                 });
-                if result.is_err() {
-                    self.store
-                        .discard(id)
-                        .context("Failed to remove incomplete login")?;
+                if let Err(e) = result {
+                    return match self.store.discard(id) {
+                        Ok(()) => Err(e),
+                        Err(cleanup) => Err(anyhow::anyhow!("{e:#}; cleanup failed: {cleanup:#}")),
+                    };
                 }
-                result?;
                 self.refresh();
             }
             Command::Register => {
@@ -304,7 +357,6 @@ impl Engine {
             Command::Switch(id) => {
                 self.store.sync_current()?;
                 if self.store.registry.active_account_id != Some(id) {
-                    self.state.stage = "switch".into();
                     self.publish();
                     let result = store::switch(&mut self.store, id, &self.rt, self.token.clone());
                     self.publish();
@@ -392,19 +444,22 @@ impl Engine {
         &mut self,
         mut read_usage: impl FnMut(&tokio::runtime::Runtime, &Path, Arc<AtomicBool>) -> Result<Usage>,
     ) {
+        if self.refresh_failed {
+            self.refresh_failed = false;
+            self.state.error = None;
+        }
         let _original = match platform::OriginalGuard::default_location() {
             Ok(g) => g,
             Err(e) => {
-                self.state.error = Some(format!("{e:#}"));
+                self.refresh_error(e);
                 self.publish();
                 return;
             }
         };
         if let Err(e) = self.store.sync_current() {
-            self.state.error = Some(format!("{e:#}"));
+            self.refresh_error(e);
             // Saved profiles have independent credentials and can still be refreshed.
         }
-        self.state.stage = "refresh".into();
         self.publish();
         for profile in self.store.registry.accounts.clone() {
             if self.token.load(Ordering::SeqCst) {
@@ -420,7 +475,7 @@ impl Engine {
             let result = read_usage(&self.rt, &home, self.token.clone());
             // Preserve rotated tokens even when the read fails or is cancelled.
             if active && let Err(e) = self.store.save_current(Some(profile.id)) {
-                self.state.error = Some(format!("{e:#}"));
+                self.refresh_error(e);
             }
             if self.token.load(Ordering::SeqCst) {
                 break;
@@ -430,7 +485,7 @@ impl Engine {
                     self.errors.remove(&profile.id);
                     if let Err(e) = self.store.cache(profile.id, usage.clone()) {
                         self.fresh.remove(&profile.id);
-                        self.state.error = Some(format!("{e:#}"));
+                        self.refresh_error(e);
                     } else {
                         self.fresh.insert(profile.id);
                     }
@@ -446,13 +501,16 @@ impl Engine {
                 let events = experiment.observe(&profile, usage.as_ref(), error, Utc::now());
                 if let Err(e) = experiment::append(&self.log(), &events) {
                     self.experiment = None;
-                    self.state.error = Some(format!("{e:#}"));
+                    self.refresh_error(e);
                 }
             }
             self.publish();
         }
-        self.state.stage.clear();
         self.publish();
+    }
+    fn refresh_error(&mut self, error: anyhow::Error) {
+        self.state.error = Some(format!("{error:#}"));
+        self.refresh_failed = true;
     }
     fn check_updates(&mut self) {
         if self.store.settings.update_repository.trim().is_empty() {
@@ -533,6 +591,8 @@ mod tests {
                 errors: HashMap::new(),
                 fresh: HashSet::new(),
                 experiment: None,
+                refresh_failed: false,
+                pending: Arc::new(AtomicUsize::new(0)),
                 shared: Arc::new(Mutex::new(Snapshot::default())),
                 ctx: egui::Context::default(),
                 token: Arc::new(AtomicBool::new(false)),
@@ -614,11 +674,14 @@ mod tests {
                     }],
                     ..Default::default()
                 },
+                warning: None,
             },
             state: Snapshot::default(),
             errors: HashMap::new(),
             fresh: HashSet::new(),
             experiment: None,
+            refresh_failed: false,
+            pending: Arc::new(AtomicUsize::new(0)),
             shared: Arc::new(Mutex::new(Snapshot::default())),
             ctx: egui::Context::default(),
             token: Arc::new(AtomicBool::new(false)),
@@ -645,6 +708,15 @@ mod tests {
                 .remaining_percent,
             42
         );
+        engine.state.busy = false;
+        engine.pending.store(1, Ordering::SeqCst);
+        engine.publish();
+        assert!(engine.state.busy);
+        assert!(engine.shared.lock().unwrap().busy);
+        engine.pending.store(0, Ordering::SeqCst);
+        engine.state.busy = false;
+        engine.publish();
+        assert!(!engine.shared.lock().unwrap().busy);
     }
 
     #[test]
@@ -707,6 +779,8 @@ mod tests {
             errors: HashMap::new(),
             fresh: HashSet::new(),
             experiment: None,
+            refresh_failed: false,
+            pending: Arc::new(AtomicUsize::new(0)),
             shared: Arc::new(Mutex::new(Snapshot::default())),
             ctx: egui::Context::default(),
             token: Arc::new(AtomicBool::new(false)),
@@ -736,6 +810,13 @@ mod tests {
             platform::read(&engine.store.active_file()).unwrap(),
             b"invalid JSON"
         );
+        platform::atomic_write(
+            &engine.store.active_file(),
+            br#"{"tokens":{"account_id":"first"}}"#,
+        )
+        .unwrap();
+        engine.refresh();
+        assert!(engine.state.error.is_none());
         drop(engine);
         platform::remove_tree(&root, &temp).unwrap();
     }

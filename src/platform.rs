@@ -104,10 +104,22 @@ pub fn secure_dir(path: &Path) -> Result<()> {
     restrict(path)
 }
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
     check_path(path)?;
     let parent = path.parent().context("Missing parent directory")?;
     secure_dir(parent)?;
+    replace_file(path, parent, bytes)
+}
+pub fn atomic_write_external(path: &Path, bytes: &[u8]) -> Result<()> {
+    check_path(path)?;
+    let parent = path.parent().context("Missing parent directory")?;
+    if !parent.exists() {
+        fs::create_dir_all(parent).context("Cannot create credential directory")?;
+    }
+    // The external directory (for example CODEX_HOME) keeps its existing ACL.
+    replace_file(path, parent, bytes)
+}
+fn replace_file(path: &Path, parent: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
     let temp = parent.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| -> Result<()> {
         let mut f = fs::OpenOptions::new()
@@ -321,9 +333,6 @@ impl Instance {
             Ok(Some(Self { mutex, activate }))
         }
     }
-    pub fn activated(&self) -> bool {
-        unsafe { WaitForSingleObject(self.activate, 0) == WAIT_OBJECT_0 }
-    }
 }
 impl Drop for Instance {
     fn drop(&mut self) {
@@ -353,8 +362,11 @@ impl Desktop {
                 app_id: None,
             });
         }
-        if let Some(app) = Self::store_installation()? {
-            return Ok(app);
+        let mut store_error = None;
+        match Self::store_installation() {
+            Ok(Some(app)) => return Ok(app),
+            Ok(None) => {}
+            Err(error) => store_error = Some(error),
         }
         for p in ["Programs/Codex/Codex.exe", "OpenAI/Codex/Codex.exe"] {
             let executable = local_data().join(p);
@@ -364,6 +376,9 @@ impl Desktop {
                     app_id: None,
                 });
             }
+        }
+        if let Some(error) = store_error {
+            return Err(error.context("Codex Desktop installation was not found"));
         }
         bail!("Codex Desktop installation was not found")
     }
@@ -611,6 +626,29 @@ impl Desktop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_write_keeps_the_external_directory_acl() {
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("switcher-external-{}", uuid::Uuid::new_v4()));
+        let external = root.join("codex-home");
+        fs::create_dir_all(&external).unwrap();
+        let file = external.join("auth.json");
+        let acl = || {
+            let output = hidden_command("icacls").arg(&external).output().unwrap();
+            assert!(output.status.success());
+            output.stdout
+        };
+        let before = acl();
+        atomic_write_external(&file, b"first").unwrap();
+        atomic_write_external(&file, b"second").unwrap();
+        assert_eq!(read(&file).unwrap(), b"second");
+        assert_eq!(before, acl());
+        let nested = external.join("nested").join("auth.json");
+        atomic_write_external(&nested, b"nested").unwrap();
+        assert_eq!(read(&nested).unwrap(), b"nested");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn desktop_process_matching_accepts_equivalent_paths() {

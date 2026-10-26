@@ -186,8 +186,6 @@ pub fn t<'a>(language: &str, key: &'a str) -> &'a str {
             "Waiting for browser sign-in…",
             "Ожидаю завершения входа…",
         ],
-        "refresh" => ["Оновлюю ліміти…", "Refreshing usage…", "Обновляю лимиты…"],
-        "working" => ["Виконую операцію…", "Working…", "Выполняю операцию…"],
         "left" => ["% лишилось", "% left", "% осталось"],
         "back" => ["Назад", "Back", "Назад"],
         "active" => ["Активний", "Active", "Активный"],

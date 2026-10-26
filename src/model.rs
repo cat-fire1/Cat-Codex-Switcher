@@ -31,6 +31,41 @@ pub struct Registry {
     pub active_account_id: Option<Uuid>,
     pub accounts: Vec<Profile>,
 }
+impl Registry {
+    pub fn label(&self, profile: &Profile) -> String {
+        let Some(email) = profile.email.as_deref() else {
+            return profile.display_name.clone();
+        };
+        let shared = self.accounts.iter().any(|other| {
+            other.id != profile.id
+                && other
+                    .email
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(email))
+        });
+        if !shared {
+            return email.to_owned();
+        }
+        let suffix = profile
+            .account_id
+            .as_deref()
+            .map(short_id)
+            .unwrap_or_default();
+        if suffix.is_empty() {
+            email.to_owned()
+        } else {
+            format!("{email} ({suffix})")
+        }
+    }
+}
+fn short_id(value: &str) -> String {
+    let chars: Vec<_> = value.chars().collect();
+    if chars.len() <= 8 {
+        value.to_owned()
+    } else {
+        chars[chars.len() - 6..].iter().collect()
+    }
+}
 fn format() -> u32 {
     FORMAT
 }
@@ -426,6 +461,31 @@ mod tests {
         let actual = identity(&bytes).unwrap();
         assert_eq!(actual.account_id.as_deref(), Some("explicit-workspace"));
         assert!(subscription(&bytes, &actual.profile()).is_none());
+    }
+
+    #[test]
+    fn colliding_emails_get_distinct_workspace_labels() {
+        let first = Identity {
+            account_id: Some("team-one".into()),
+            email: Some("person@example.test".into()),
+        }
+        .profile();
+        let second = Identity {
+            account_id: Some("team-two".into()),
+            email: Some("person@example.test".into()),
+        }
+        .profile();
+        let mut registry = Registry {
+            accounts: vec![first.clone(), second.clone()],
+            ..Default::default()
+        };
+        let one = registry.label(&first);
+        let two = registry.label(&second);
+        assert_ne!(one, two);
+        assert!(one.contains("team-one"));
+        assert!(two.contains("team-two"));
+        registry.accounts.pop();
+        assert_eq!(registry.label(&first), "person@example.test");
     }
 
     #[test]

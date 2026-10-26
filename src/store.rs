@@ -17,6 +17,7 @@ pub struct Store {
     pub registry: Registry,
     pub settings: Settings,
     pub cache: Cache,
+    pub warning: Option<String>,
 }
 #[derive(Clone, PartialEq, Eq)]
 pub struct ImportPreview {
@@ -34,22 +35,45 @@ struct ImportData {
 impl Store {
     pub fn load(root: PathBuf, active: PathBuf) -> Result<Self> {
         platform::secure_dir(&root)?;
-        let registry: Registry = load_or(&root.join("accounts.json"))?;
-        let settings: Settings = load_or(&root.join("settings.json"))?;
-        let cache: Cache = load_or(&root.join("usage-cache.json"))?;
+        let accounts = root.join("accounts.json");
+        let registry: Registry = load_or(&accounts).with_context(|| {
+            format!(
+                "Saved account list is unreadable. Rename or delete {} to reset it; saved login files stay on disk.",
+                accounts.display()
+            )
+        })?;
         ensure!(
-            registry.format_version <= FORMAT
-                && settings.format_version <= FORMAT
-                && cache.format_version <= FORMAT,
+            registry.format_version <= FORMAT,
             "Unsupported data format version"
         );
         validate_registry(&registry)?;
+        let (settings, settings_warning) =
+            load_recovered(&root.join("settings.json"), |value: &Settings| {
+                ensure!(
+                    value.format_version <= FORMAT,
+                    "Unsupported data format version"
+                );
+                Ok(())
+            })?;
+        let (cache, cache_warning) =
+            load_recovered(&root.join("usage-cache.json"), |value: &Cache| {
+                ensure!(
+                    value.format_version <= FORMAT,
+                    "Unsupported data format version"
+                );
+                Ok(())
+            })?;
+        let warnings: Vec<_> = [settings_warning, cache_warning]
+            .into_iter()
+            .flatten()
+            .collect();
         Ok(Self {
             root,
             active,
             registry,
             settings,
             cache,
+            warning: (!warnings.is_empty()).then(|| warnings.join("\n")),
         })
     }
     pub fn home(&self, id: Uuid) -> PathBuf {
@@ -211,7 +235,7 @@ impl Store {
             identity(&bytes)?.matches(profile),
             "Target credential identity mismatch"
         );
-        platform::atomic_write(&self.active_file(), &bytes)
+        platform::atomic_write_external(&self.active_file(), &bytes)
     }
     pub fn restore(&self, original: Option<Uuid>) -> Result<()> {
         if let Some(id) = original {
@@ -308,7 +332,7 @@ impl Store {
             if self.registry.accounts.iter().any(|p| i.matches(p)) {
                 duplicates += 1;
             } else {
-                titles.push(p.title().to_owned());
+                titles.push(data.registry.label(p));
             }
         }
         Ok(ImportPreview {
@@ -429,6 +453,45 @@ fn load_or<T: DeserializeOwned + Default>(p: &Path) -> Result<T> {
     }
     serde_json::from_slice(&platform::read(p)?).context("Invalid local data format")
 }
+fn load_recovered<T: DeserializeOwned + Default>(
+    p: &Path,
+    validate: impl Fn(&T) -> Result<()>,
+) -> Result<(T, Option<String>)> {
+    platform::check_path(p)?;
+    if !p.exists() {
+        return Ok((T::default(), None));
+    }
+    let bytes = platform::read(p)?;
+    let parsed = serde_json::from_slice::<T>(&bytes)
+        .map_err(anyhow::Error::from)
+        .and_then(|value| {
+            validate(&value)?;
+            Ok(value)
+        });
+    match parsed {
+        Ok(value) => Ok((value, None)),
+        Err(error) => {
+            let backup = p.with_file_name(format!(
+                "{}.corrupt-{}",
+                p.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("data"),
+                Uuid::new_v4()
+            ));
+            let moved = match fs::rename(p, &backup) {
+                Ok(()) => format!("moved to {}", backup.display()),
+                Err(rename) => format!("could not be moved: {rename}"),
+            };
+            Ok((
+                T::default(),
+                Some(format!(
+                    "Ignored invalid {}: {error}. The damaged file was {moved}.",
+                    p.display()
+                )),
+            ))
+        }
+    }
+}
 fn validate_registry(r: &Registry) -> Result<()> {
     let mut ids = HashSet::new();
     for p in &r.accounts {
@@ -499,6 +562,7 @@ pub fn switch(
         store.registry.accounts.iter().any(|p| p.id == target),
         "Target account missing"
     );
+    let runtime = rpc::locate()?;
     let desktop = platform::Desktop::discover()?;
     let original = store.registry.active_account_id;
     struct Operation<'a> {
@@ -506,6 +570,7 @@ pub fn switch(
         target: Uuid,
         original: Option<Uuid>,
         desktop: platform::Desktop,
+        runtime: PathBuf,
         rt: &'a tokio::runtime::Runtime,
         cancel: Arc<AtomicBool>,
     }
@@ -526,7 +591,7 @@ pub fn switch(
                 .context("Target account missing")?;
             // Refresh the saved home so failed verification retains any rotated tokens.
             self.rt.block_on(rpc::verify_login(
-                &rpc::locate()?,
+                &self.runtime,
                 &self.store.home(self.target),
                 profile,
                 self.cancel.clone(),
@@ -551,6 +616,7 @@ pub fn switch(
         target,
         original,
         desktop,
+        runtime,
         rt,
         cancel,
     })
@@ -568,6 +634,39 @@ mod tests {
         platform::atomic_write(&store.credential(profile.id), &bytes).unwrap();
         store.add(profile.clone()).unwrap();
         profile
+    }
+
+    #[test]
+    fn corrupt_settings_and_cache_are_recovered_but_accounts_stay_strict() {
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("switcher-recovery-{}", Uuid::new_v4()));
+        let store_root = root.join("store");
+        fs::create_dir_all(&store_root).unwrap();
+        fs::write(
+            store_root.join("settings.json"),
+            br#"{"formatVersion": 999}"#,
+        )
+        .unwrap();
+        fs::write(store_root.join("usage-cache.json"), b"{").unwrap();
+        let store = Store::load(store_root.clone(), root.join("active")).unwrap();
+        assert_eq!(store.settings.format_version, FORMAT);
+        assert!(store.cache.entries.is_empty());
+        let warning = store.warning.unwrap();
+        assert!(warning.contains("settings.json"));
+        assert!(warning.contains("usage-cache.json"));
+        let backups = fs::read_dir(&store_root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"))
+            .count();
+        assert_eq!(backups, 2);
+        fs::write(store_root.join("accounts.json"), b"{").unwrap();
+        let error = match Store::load(store_root, root.join("active")) {
+            Ok(_) => panic!("corrupt accounts.json must not be ignored"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("Rename or delete"));
+        platform::remove_tree(&root, &temp).unwrap();
     }
 
     #[test]

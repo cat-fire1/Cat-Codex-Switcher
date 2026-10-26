@@ -34,6 +34,10 @@ fn version(tag: &str) -> Option<[u64; 3]> {
         parts[2].parse().ok()?,
     ])
 }
+fn current_version(value: &str) -> Option<[u64; 3]> {
+    let core = value.split(['-', '+']).next()?;
+    version(&format!("v{core}"))
+}
 pub fn latest(rows: &[Value]) -> Option<([u64; 3], String)> {
     rows.iter()
         .filter(|r| {
@@ -84,11 +88,33 @@ pub async fn check(repo: &str) -> Result<Option<String>> {
         if rows.len() < 100 {
             break;
         }
-        ensure!(page < 100, "Update release list exceeded its page limit");
     }
-    let current = version(concat!("v", env!("CARGO_PKG_VERSION")))
-        .expect("Cargo package has a semver version");
+    let current = current_version(env!("CARGO_PKG_VERSION"))
+        .ok_or_else(|| anyhow::anyhow!("Invalid package version"))?;
     Ok(best
         .filter(|b| b.0 > current)
         .map(|(_, tag)| format!("https://github.com/{repo}/releases/tag/{tag}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_tags_stay_strict_but_package_versions_allow_suffixes() {
+        assert_eq!(version("v1.2.3"), Some([1, 2, 3]));
+        assert_eq!(version("v0.1.1"), Some([0, 1, 1]));
+        for tag in [
+            "1.2.3",
+            "v1.2",
+            "v01.2.3",
+            "v1.2.3-beta.1",
+            "v1.2.3+build.7",
+        ] {
+            assert_eq!(version(tag), None);
+        }
+        assert_eq!(current_version("0.2.0-beta.1"), Some([0, 2, 0]));
+        assert_eq!(current_version("1.2.3+build.7"), Some([1, 2, 3]));
+        assert_eq!(current_version("1.2"), None);
+    }
 }
