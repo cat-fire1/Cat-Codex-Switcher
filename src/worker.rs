@@ -36,6 +36,7 @@ pub struct Snapshot {
     pub settings: Settings,
     pub busy: bool,
     pub adding: bool,
+    pub refreshing: bool,
     pub error: Option<String>,
     pub preview: Option<ImportPreview>,
     pub update_url: Option<String>,
@@ -49,11 +50,17 @@ impl Default for Snapshot {
             settings: Settings::default(),
             busy: true,
             adding: false,
+            refreshing: false,
             error: None,
             preview: None,
             update_url: None,
             update_status: String::new(),
         }
+    }
+}
+impl Snapshot {
+    pub fn can_quit(&self) -> bool {
+        !self.adding && (!self.busy || self.refreshing)
     }
 }
 pub enum Command {
@@ -114,7 +121,6 @@ impl Worker {
                     rt,
                 };
                 if let Err(e) = engine.reset_experiment("resumed") {
-                    engine.experiment = None;
                     engine.state.error = Some(format!("{e:#}"));
                 }
                 if let Some(warning) = engine.store.warning.clone() {
@@ -135,7 +141,9 @@ impl Worker {
                 engine.state.busy = true;
                 engine.publish();
                 engine.refresh();
-                if engine.store.settings.automatically_check_updates {
+                if engine.store.settings.automatically_check_updates
+                    && !engine.token.load(Ordering::SeqCst)
+                {
                     engine.check_updates();
                 }
                 engine.state.busy = false;
@@ -191,7 +199,9 @@ impl Worker {
                                     next_refresh = Instant::now() + Duration::from_secs(300);
                                 }
                                 if update_due {
-                                    if engine.store.settings.automatically_check_updates {
+                                    if engine.store.settings.automatically_check_updates
+                                        && !engine.token.load(Ordering::SeqCst)
+                                    {
                                         engine.check_updates();
                                     }
                                     next_update = Instant::now() + Duration::from_secs(3600);
@@ -297,19 +307,41 @@ impl Engine {
             })
             .collect();
         if let Ok(mut latest) = self.shared.lock() {
-            self.state.busy |= self.pending.load(Ordering::SeqCst) > 0;
-            *latest = self.state.clone();
+            let queued = self.pending.load(Ordering::SeqCst) > 0;
+            self.state.busy |= queued;
+            let mut snapshot = self.state.clone();
+            snapshot.refreshing &= !queued;
+            *latest = snapshot;
         }
         self.ctx.request_repaint();
     }
     fn reset_experiment(&mut self, event: &str) -> Result<()> {
         if self.store.settings.reset_expiry_experiment_enabled {
-            self.experiment = Some(Experiment::load(&self.log())?);
-            experiment::append(&self.log(), &[Event::marker(event, Utc::now())])?;
+            let result = Experiment::load(&self.log()).and_then(|experiment| {
+                experiment::append(&self.log(), &[Event::marker(event, Utc::now())])?;
+                Ok(experiment)
+            });
+            match result {
+                Ok(experiment) => self.experiment = Some(experiment),
+                Err(error) => return Err(self.stop_experiment(error)),
+            }
         } else {
             self.experiment = None;
         }
         Ok(())
+    }
+    fn stop_experiment(&mut self, error: anyhow::Error) -> anyhow::Error {
+        self.experiment = None;
+        let mut settings = self.store.settings.clone();
+        settings.reset_expiry_experiment_enabled = false;
+        if let Err(save) = self.store.save_settings(settings.clone()) {
+            self.store.settings = settings;
+            anyhow::anyhow!(
+                "Reset experiment stopped: {error:#}; could not save disabled setting: {save:#}"
+            )
+        } else {
+            error.context("Reset experiment stopped")
+        }
     }
     fn command(&mut self, command: Command) -> Result<()> {
         let _original = if matches!(
@@ -348,6 +380,7 @@ impl Engine {
                         Err(cleanup) => Err(anyhow::anyhow!("{e:#}; cleanup failed: {cleanup:#}")),
                     };
                 }
+                self.state.adding = false;
                 self.refresh();
             }
             Command::Register => {
@@ -427,11 +460,13 @@ impl Engine {
         Ok(())
     }
     fn refresh(&mut self) {
+        self.state.refreshing = true;
+        self.publish();
         let exe = rpc::locate();
-        self.refresh_with(|rt, home, token| match &exe {
+        self.refresh_with(|rt, home, profile, token| match &exe {
             Ok(exe) => rt.block_on(async {
                 let mut session = rpc::Session::start(exe, home, token).await?;
-                let result = session.usage().await;
+                let result = session.usage(profile).await;
                 session.stop().await;
                 result
             }),
@@ -439,10 +474,17 @@ impl Engine {
                 "Codex runtime not found. Set CODEX_CLI_PATH."
             )),
         });
+        self.state.refreshing = false;
+        self.publish();
     }
     fn refresh_with(
         &mut self,
-        mut read_usage: impl FnMut(&tokio::runtime::Runtime, &Path, Arc<AtomicBool>) -> Result<Usage>,
+        mut read_usage: impl FnMut(
+            &tokio::runtime::Runtime,
+            &Path,
+            &Profile,
+            Arc<AtomicBool>,
+        ) -> Result<Usage>,
     ) {
         if self.refresh_failed {
             self.refresh_failed = false;
@@ -472,10 +514,12 @@ impl Engine {
             } else {
                 self.store.home(profile.id)
             };
-            let result = read_usage(&self.rt, &home, self.token.clone());
+            let mut result = read_usage(&self.rt, &home, &profile, self.token.clone());
             // Preserve rotated tokens even when the read fails or is cancelled.
             if active && let Err(e) = self.store.save_current(Some(profile.id)) {
-                self.refresh_error(e);
+                let message = format!("{e:#}");
+                self.refresh_error(anyhow::anyhow!(message.clone()));
+                result = Err(anyhow::anyhow!(message));
             }
             if self.token.load(Ordering::SeqCst) {
                 break;
@@ -500,8 +544,8 @@ impl Engine {
             if let Some(experiment) = &mut self.experiment {
                 let events = experiment.observe(&profile, usage.as_ref(), error, Utc::now());
                 if let Err(e) = experiment::append(&self.log(), &events) {
-                    self.experiment = None;
-                    self.refresh_error(e);
+                    let error = self.stop_experiment(e);
+                    self.refresh_error(error);
                 }
             }
             self.publish();
@@ -547,6 +591,14 @@ impl Engine {
 mod tests {
     use super::*;
 
+    fn credential(account: &str, refresh_token: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({"tokens": {
+            "account_id": account,
+            "refresh_token": refresh_token,
+            "id_token": "a.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF91c2VyX2lkIjoidGVzdC11c2VyIn19.b"
+        }})).unwrap()
+    }
+
     #[test]
     fn refresh_preserves_rotated_tokens_on_success_failure_and_cancellation() {
         if std::env::var_os("SWITCHER_TOKEN_TEST_CHILD").is_none() {
@@ -567,15 +619,15 @@ mod tests {
         ] {
             let root = temp.join(format!("switcher-tokens-{}", Uuid::new_v4()));
             let mut store = Store::load(root.join("store"), root.join("active")).unwrap();
-            let old = br#"{"tokens":{"account_id":"active","refresh_token":"old-fake"}}"#;
-            let new = br#"{"tokens":{"account_id":"active","refresh_token":"new-fake"}}"#;
-            let other = br#"{"tokens":{"account_id":"inactive"}}"#;
-            platform::atomic_write(&store.active_file(), old).unwrap();
+            let old = credential("active", "old-fake");
+            let new = credential("active", "new-fake");
+            let other = credential("inactive", "other-fake");
+            platform::atomic_write(&store.active_file(), &old).unwrap();
             store.sync_current().unwrap();
             let id = store.registry.active_account_id.unwrap();
-            let inactive = identity(other).unwrap().profile();
+            let inactive = identity(&other).unwrap().profile();
             let inactive_home = store.home(inactive.id);
-            platform::atomic_write(&store.credential(inactive.id), other).unwrap();
+            platform::atomic_write(&store.credential(inactive.id), &other).unwrap();
             store.add(inactive.clone()).unwrap();
             if invalid_active {
                 platform::atomic_write(&store.active_file(), b"invalid JSON").unwrap();
@@ -599,10 +651,10 @@ mod tests {
                 rt: tokio::runtime::Runtime::new().unwrap(),
             };
             let mut homes = Vec::new();
-            engine.refresh_with(|_, home, token| {
+            engine.refresh_with(|_, home, _, token| {
                 homes.push(home.to_owned());
                 if home == expected_home {
-                    platform::atomic_write(&home.join("auth.json"), new).unwrap();
+                    platform::atomic_write(&home.join("auth.json"), &new).unwrap();
                     token.store(cancelled, Ordering::SeqCst);
                     ensure!(!failed_read, "Simulated usage failure after token rotation");
                 } else {
@@ -610,7 +662,7 @@ mod tests {
                 }
                 Ok(Usage {
                     remaining_percent: 42,
-                    resets_at: Utc::now(),
+                    resets_at: Some(Utc::now()),
                     five_hour_remaining_percent: None,
                     five_hour_resets_at: None,
                     reset_credits_remaining: None,
@@ -640,9 +692,108 @@ mod tests {
     }
 
     #[test]
+    fn refresh_discards_usage_if_active_identity_changes() {
+        if std::env::var_os("SWITCHER_IDENTITY_TEST_CHILD").is_none() {
+            let isolated = std::env::temp_dir().join(Uuid::new_v4().to_string());
+            let status = platform::hidden_command(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "worker::tests::refresh_discards_usage_if_active_identity_changes",
+                ])
+                .env("SWITCHER_IDENTITY_TEST_CHILD", "1")
+                .env("CODEX_SWITCHER_DATA_HOME", isolated)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("switcher-refresh-identity-{}", Uuid::new_v4()));
+        let mut store = Store::load(root.join("store"), root.join("active")).unwrap();
+        platform::atomic_write(&store.active_file(), &credential("alice", "old")).unwrap();
+        store.sync_current().unwrap();
+        let id = store.registry.active_account_id.unwrap();
+        let usage = Usage {
+            remaining_percent: 42,
+            resets_at: Some(Utc::now()),
+            five_hour_remaining_percent: None,
+            five_hour_resets_at: None,
+            reset_credits_remaining: None,
+            reset_credits: None,
+        };
+        store.cache(id, usage.clone()).unwrap();
+        let active = store.active_file();
+        let mut engine = Engine {
+            store,
+            state: Snapshot::default(),
+            errors: HashMap::new(),
+            fresh: HashSet::new(),
+            experiment: None,
+            refresh_failed: false,
+            pending: Arc::new(AtomicUsize::new(0)),
+            shared: Arc::new(Mutex::new(Snapshot::default())),
+            ctx: egui::Context::default(),
+            token: Arc::new(AtomicBool::new(false)),
+            rt: tokio::runtime::Runtime::new().unwrap(),
+        };
+        engine.refresh_with(|_, _, _, _| {
+            platform::atomic_write(&active, &credential("bob", "new")).unwrap();
+            let mut wrong = usage.clone();
+            wrong.remaining_percent = 7;
+            Ok(wrong)
+        });
+        let row = &engine.state.rows[0];
+        assert_eq!(row.usage.as_ref().unwrap().remaining_percent, 42);
+        assert!(row.stale);
+        assert!(
+            row.error
+                .as_deref()
+                .unwrap()
+                .contains("Current login changed")
+        );
+        drop(engine);
+        platform::remove_tree(&root, &temp).unwrap();
+    }
+
+    #[test]
+    fn experiment_failure_clears_the_enabled_setting() {
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("switcher-experiment-state-{}", Uuid::new_v4()));
+        let store = Store::load(root.join("store"), root.join("active")).unwrap();
+        let mut engine = Engine {
+            store,
+            state: Snapshot::default(),
+            errors: HashMap::new(),
+            fresh: HashSet::new(),
+            experiment: None,
+            refresh_failed: false,
+            pending: Arc::new(AtomicUsize::new(0)),
+            shared: Arc::new(Mutex::new(Snapshot::default())),
+            ctx: egui::Context::default(),
+            token: Arc::new(AtomicBool::new(false)),
+            rt: tokio::runtime::Runtime::new().unwrap(),
+        };
+        platform::atomic_write(&engine.log(), b"{broken}\n").unwrap();
+        let mut settings = engine.store.settings.clone();
+        settings.reset_expiry_experiment_enabled = true;
+        assert!(engine.command(Command::Settings(settings.clone())).is_err());
+        assert!(!engine.store.settings.reset_expiry_experiment_enabled);
+        assert!(engine.experiment.is_none());
+        let saved = Store::load(engine.store.root.clone(), engine.store.active.clone()).unwrap();
+        assert!(!saved.settings.reset_expiry_experiment_enabled);
+
+        engine.store.save_settings(settings).unwrap();
+        assert!(engine.reset_experiment("resumed").is_err());
+        assert!(!engine.store.settings.reset_expiry_experiment_enabled);
+        drop(engine);
+        platform::remove_tree(&root, &temp).unwrap();
+    }
+
+    #[test]
     fn cached_usage_is_stale_until_refreshed_in_this_run() {
         let profile = Identity {
             account_id: Some("saved-id".into()),
+            user_id: Some("saved-user".into()),
             email: None,
         }
         .profile();
@@ -665,7 +816,7 @@ mod tests {
                         fetched_at,
                         usage: Usage {
                             remaining_percent: 42,
-                            resets_at: fetched_at,
+                            resets_at: Some(fetched_at),
                             five_hour_remaining_percent: None,
                             five_hour_resets_at: None,
                             reset_credits_remaining: None,
@@ -745,6 +896,7 @@ mod tests {
             .map(|id| {
                 Identity {
                     account_id: Some(id.into()),
+                    user_id: Some("test-user".into()),
                     email: None,
                 }
                 .profile()
@@ -764,7 +916,7 @@ mod tests {
                     profile.id,
                     Usage {
                         remaining_percent: 42,
-                        resets_at: Utc::now(),
+                        resets_at: Some(Utc::now()),
                         five_hour_remaining_percent: None,
                         five_hour_resets_at: None,
                         reset_credits_remaining: None,
@@ -810,11 +962,7 @@ mod tests {
             platform::read(&engine.store.active_file()).unwrap(),
             b"invalid JSON"
         );
-        platform::atomic_write(
-            &engine.store.active_file(),
-            br#"{"tokens":{"account_id":"first"}}"#,
-        )
-        .unwrap();
+        platform::atomic_write(&engine.store.active_file(), &credential("first", "fake")).unwrap();
         engine.refresh();
         assert!(engine.state.error.is_none());
         drop(engine);

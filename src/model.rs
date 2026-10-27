@@ -14,6 +14,8 @@ pub struct Profile {
     pub email: Option<String>,
     #[serde(rename = "accountID")]
     pub account_id: Option<String>,
+    #[serde(default, rename = "userID", skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
 }
@@ -33,29 +35,30 @@ pub struct Registry {
 }
 impl Registry {
     pub fn label(&self, profile: &Profile) -> String {
-        let Some(email) = profile.email.as_deref() else {
-            return profile.display_name.clone();
-        };
-        let shared = self.accounts.iter().any(|other| {
-            other.id != profile.id
-                && other
-                    .email
-                    .as_deref()
-                    .is_some_and(|value| value.eq_ignore_ascii_case(email))
-        });
-        if !shared {
-            return email.to_owned();
+        let title = profile.title();
+        let others: Vec<_> = self
+            .accounts
+            .iter()
+            .filter(|other| other.id != profile.id && other.title().eq_ignore_ascii_case(title))
+            .collect();
+        if others.is_empty() {
+            return title.to_owned();
         }
-        let suffix = profile
-            .account_id
-            .as_deref()
-            .map(short_id)
-            .unwrap_or_default();
-        if suffix.is_empty() {
-            email.to_owned()
-        } else {
-            format!("{email} ({suffix})")
+        if let Some(account) = profile.account_id.as_deref().map(short_id)
+            && others
+                .iter()
+                .all(|other| other.account_id.as_deref().map(short_id).as_ref() != Some(&account))
+        {
+            return format!("{title} ({account})");
         }
+        if let Some(user) = profile.user_id.as_deref().map(short_id)
+            && others
+                .iter()
+                .all(|other| other.user_id.as_deref().map(short_id).as_ref() != Some(&user))
+        {
+            return format!("{title} ({user})");
+        }
+        format!("{title} ({})", profile.id)
     }
 }
 fn short_id(value: &str) -> String {
@@ -109,7 +112,7 @@ pub struct Credit {
 #[serde(rename_all = "camelCase")]
 pub struct Usage {
     pub remaining_percent: i32,
-    pub resets_at: DateTime<Utc>,
+    pub resets_at: Option<DateTime<Utc>>,
     pub five_hour_remaining_percent: Option<i32>,
     pub five_hour_resets_at: Option<DateTime<Utc>>,
     pub reset_credits_remaining: Option<i64>,
@@ -133,22 +136,17 @@ pub struct Cache {
 #[derive(Clone, Debug)]
 pub struct Identity {
     pub account_id: Option<String>,
+    pub user_id: Option<String>,
     pub email: Option<String>,
 }
 impl Identity {
     pub fn matches(&self, p: &Profile) -> bool {
-        match (&self.account_id, &p.account_id) {
-            (Some(a), Some(b)) => {
-                a == b
-                    && match (&self.email, &p.email) {
-                        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-                        _ => true,
-                    }
-            }
-            (None, None) => {
-                matches!((&self.email, &p.email), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b))
-            }
-            _ => false,
+        if self.account_id != p.account_id {
+            return false;
+        }
+        match (&self.user_id, &p.user_id) {
+            (Some(a), Some(b)) => a == b,
+            _ => matches!((&self.email, &p.email), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b)),
         }
     }
     pub fn profile(&self) -> Profile {
@@ -162,6 +160,7 @@ impl Identity {
                 .into(),
             email: self.email.clone(),
             account_id: self.account_id.clone(),
+            user_id: self.user_id.clone(),
             created_at: Utc::now(),
             last_used_at: None,
         }
@@ -201,16 +200,27 @@ pub fn identity(bytes: &[u8]) -> Result<Identity> {
                     .as_str(),
             )
         });
-    let email = nonempty(
-        payload
-            .as_ref()
-            .and_then(|p| p.get("email"))
-            .and_then(Value::as_str),
-    );
+    let email = payload.as_ref().and_then(|p| {
+        nonempty(p.get("email").and_then(Value::as_str)).or_else(|| {
+            nonempty(
+                p.pointer("/https:~1~1api.openai.com~1profile/email")
+                    .and_then(Value::as_str),
+            )
+        })
+    });
+    let user_id = payload.as_ref().and_then(|p| {
+        let auth = p.get("https://api.openai.com/auth")?;
+        nonempty(auth.get("chatgpt_user_id").and_then(Value::as_str))
+            .or_else(|| nonempty(auth.get("user_id").and_then(Value::as_str)))
+    });
     if account_id.is_none() {
         bail!("Credential identity unavailable");
     }
-    Ok(Identity { account_id, email })
+    Ok(Identity {
+        account_id,
+        user_id,
+        email,
+    })
 }
 pub fn subscription(bytes: &[u8], profile: &Profile) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
     if !identity(bytes).ok()?.matches(profile) {
@@ -253,7 +263,10 @@ pub fn normalize(v: &Value) -> Result<Usage> {
                 .or_else(|| w.get("durationMinutes"))?
                 .as_i64()?;
             let used = w.get("usedPercent")?.as_f64()?;
-            let at = service_date(w.get("resetsAt")?)?;
+            let at = match w.get("resetsAt") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(service_date(value)?),
+            };
             Some((
                 duration,
                 (100.0 - used).round().clamp(0.0, 100.0) as i32,
@@ -303,7 +316,7 @@ pub fn normalize(v: &Value) -> Result<Usage> {
         remaining_percent: weekly.1,
         resets_at: weekly.2,
         five_hour_remaining_percent: five.map(|w| w.1),
-        five_hour_resets_at: five.map(|w| w.2),
+        five_hour_resets_at: five.and_then(|w| w.2),
         reset_credits_remaining: v
             .pointer("/rateLimitResetCredits/availableCount")
             .and_then(Value::as_i64)
@@ -344,7 +357,7 @@ mod tests {
             assert_eq!(usage.five_hour_remaining_percent, Some(88));
             assert_eq!(
                 usage.resets_at,
-                DateTime::from_timestamp(1_800_100_000, 500_000_000).unwrap()
+                DateTime::from_timestamp(1_800_100_000, 500_000_000)
             );
             assert_eq!(
                 usage.five_hour_resets_at,
@@ -382,6 +395,24 @@ mod tests {
                 "Weekly usage unavailable"
             );
         }
+    }
+
+    #[test]
+    fn usage_keeps_percentages_when_reset_dates_are_unknown() {
+        let usage = normalize(&json!({"rateLimits": {
+            "primary": {"windowDurationMins": 10080, "usedPercent": 40, "resetsAt": null},
+            "secondary": {"windowDurationMins": 300, "usedPercent": 10}
+        }}))
+        .unwrap();
+        assert_eq!(usage.remaining_percent, 60);
+        assert_eq!(usage.resets_at, None);
+        assert_eq!(usage.five_hour_remaining_percent, Some(90));
+        assert_eq!(usage.five_hour_resets_at, None);
+
+        let mut saved = serde_json::to_value(&usage).unwrap();
+        saved["resetsAt"] = json!("2026-11-01T12:00:00Z");
+        let old: Usage = serde_json::from_value(saved).unwrap();
+        assert!(old.resets_at.is_some());
     }
 
     #[test]
@@ -464,14 +495,34 @@ mod tests {
     }
 
     #[test]
+    fn user_ids_take_priority_and_missing_identity_never_matches() {
+        let first = Identity {
+            account_id: Some("workspace".into()),
+            user_id: Some("alice".into()),
+            email: Some("old@example.test".into()),
+        };
+        let mut changed_email = first.clone();
+        changed_email.email = Some("new@example.test".into());
+        assert!(changed_email.matches(&first.profile()));
+        let mut other = first.clone();
+        other.user_id = Some("bob".into());
+        other.email = None;
+        assert!(!other.matches(&first.profile()));
+        other.user_id = None;
+        assert!(!other.matches(&first.profile()));
+    }
+
+    #[test]
     fn colliding_emails_get_distinct_workspace_labels() {
         let first = Identity {
             account_id: Some("team-one".into()),
+            user_id: None,
             email: Some("person@example.test".into()),
         }
         .profile();
         let second = Identity {
             account_id: Some("team-two".into()),
+            user_id: None,
             email: Some("person@example.test".into()),
         }
         .profile();
@@ -486,6 +537,28 @@ mod tests {
         assert!(two.contains("team-two"));
         registry.accounts.pop();
         assert_eq!(registry.label(&first), "person@example.test");
+    }
+
+    #[test]
+    fn same_workspace_users_without_emails_have_distinct_labels() {
+        let first = Identity {
+            account_id: Some("workspace".into()),
+            user_id: Some("alice".into()),
+            email: None,
+        }
+        .profile();
+        let second = Identity {
+            account_id: Some("workspace".into()),
+            user_id: Some("bob".into()),
+            email: None,
+        }
+        .profile();
+        let registry = Registry {
+            accounts: vec![first.clone(), second.clone()],
+            ..Default::default()
+        };
+        assert_eq!(registry.label(&first), "Codex Account (alice)");
+        assert_eq!(registry.label(&second), "Codex Account (bob)");
     }
 
     #[test]

@@ -66,7 +66,7 @@ impl Shell {
                             ctx.request_repaint();
                         }
                         Action::Quit => {
-                            if state.lock().is_ok_and(|s| !s.busy && !s.adding) {
+                            if state.lock().is_ok_and(|s| s.can_quit()) {
                                 exit_signal.store(true, Ordering::SeqCst);
                                 unsafe {
                                     let _ = ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
@@ -180,7 +180,7 @@ impl Tray {
     }
     pub fn update(&mut self, s: &Snapshot, lang: &str) -> Result<()> {
         let text = i18n::t(lang, "quit").to_owned();
-        let enabled = !s.busy && !s.adding;
+        let enabled = s.can_quit();
         if self.last_menu.as_ref() != Some(&(text.clone(), enabled)) {
             self.quit.set_text(text.as_str());
             self.quit.set_enabled(enabled);

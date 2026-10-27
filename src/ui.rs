@@ -103,7 +103,9 @@ impl App {
                 match worker.send(command) {
                     Ok(()) => {
                         self.state.busy = true;
+                        self.state.refreshing = false;
                         s.busy = true;
+                        s.refreshing = false;
                     }
                     Err(e) => {
                         self.state.busy = false;
@@ -128,7 +130,7 @@ impl App {
         }
     }
     fn quit(&mut self, ctx: &egui::Context) {
-        if self.state.busy || self.state.adding {
+        if !self.shared.lock().is_ok_and(|s| s.can_quit()) {
             return;
         }
         self.exit = true;
@@ -497,16 +499,17 @@ impl App {
                                     });
                                     if let Some(usage) = &row.usage {
                                         if self.state.settings.shows_five_hour_usage
-                                            && let (Some(five), Some(at)) = (
-                                                usage.five_hour_remaining_percent,
-                                                usage.five_hour_resets_at,
-                                            )
+                                            && let Some(five) = usage.five_hour_remaining_percent
                                         {
                                             usage_line(
                                                 ui,
                                                 i18n::t(lang, "five_hour"),
                                                 five,
-                                                Some(reset_text(at, lang, false)),
+                                                Some(reset_text(
+                                                    usage.five_hour_resets_at,
+                                                    lang,
+                                                    false,
+                                                )),
                                                 lang,
                                             );
                                         }
@@ -892,7 +895,7 @@ impl eframe::App for App {
             if self.tray.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            } else if self.state.busy {
+            } else if !self.state.can_quit() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             } else {
                 self.quit(ctx);
@@ -1062,12 +1065,15 @@ fn initials(name: &str) -> String {
         .collect();
     if value.is_empty() { "?".into() } else { value }
 }
-fn reset_text(at: DateTime<Utc>, lang: &str, date: bool) -> String {
+fn reset_text(at: Option<DateTime<Utc>>, lang: &str, date: bool) -> String {
     format!(
         "{} {}",
         i18n::t(lang, "resets"),
-        at.with_timezone(&Local)
+        at.map(|at| at
+            .with_timezone(&Local)
             .format(if date { "%m-%d %H:%M" } else { "%H:%M" })
+            .to_string())
+            .unwrap_or_else(|| i18n::t(lang, "unknown").to_owned())
     )
 }
 fn usage_line(ui: &mut egui::Ui, title: &str, percent: i32, reset: Option<String>, lang: &str) {
@@ -1205,13 +1211,14 @@ mod tests {
                     display_name: "A very long workspace name".into(),
                     email: None,
                     account_id: None,
+                    user_id: None,
                     created_at: Utc::now(),
                     last_used_at: None,
                 },
                 title: "long.account.name+workspace@example.com".into(),
                 usage: Some(crate::model::Usage {
                     remaining_percent: 22,
-                    resets_at: Utc::now(),
+                    resets_at: Some(Utc::now()),
                     five_hour_remaining_percent: Some(94),
                     five_hour_resets_at: Some(Utc::now()),
                     reset_credits_remaining: Some(3),
@@ -1330,5 +1337,47 @@ mod tests {
         }
         app.quit(&egui::Context::default());
         assert!(app.exit);
+    }
+
+    #[test]
+    fn quitting_cancels_refresh_but_not_queued_work() {
+        let (commands, receiver) = mpsc::channel();
+        let state = Snapshot {
+            busy: true,
+            refreshing: true,
+            ..Default::default()
+        };
+        let mut app = App {
+            shared: Arc::new(Mutex::new(state.clone())),
+            state,
+            worker: Some(Worker {
+                commands,
+                cancel: Arc::new(AtomicBool::new(false)),
+                pending: Arc::new(AtomicUsize::new(0)),
+                join: None,
+            }),
+            _instance: None,
+            tray: None,
+            page: Page::Accounts,
+            repository: String::new(),
+            import_path: String::new(),
+            exit: false,
+            initial_hide: false,
+            local_error: None,
+            fitted_height: 0.0,
+        };
+        app.send(Command::Refresh);
+        app.quit(&egui::Context::default());
+        assert!(!app.exit);
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Refresh));
+
+        let worker = app.worker.as_ref().unwrap();
+        worker.pending.store(0, Ordering::SeqCst);
+        worker.cancel.store(false, Ordering::SeqCst);
+        app.shared.lock().unwrap().refreshing = true;
+        app.quit(&egui::Context::default());
+        assert!(app.exit);
+        assert!(app.worker.as_ref().unwrap().cancel.load(Ordering::SeqCst));
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Shutdown));
     }
 }

@@ -36,7 +36,7 @@ impl Store {
     pub fn load(root: PathBuf, active: PathBuf) -> Result<Self> {
         platform::secure_dir(&root)?;
         let accounts = root.join("accounts.json");
-        let registry: Registry = load_or(&accounts).with_context(|| {
+        let mut registry: Registry = load_or(&accounts).with_context(|| {
             format!(
                 "Saved account list is unreadable. Rename or delete {} to reset it; saved login files stay on disk.",
                 accounts.display()
@@ -46,6 +46,22 @@ impl Store {
             registry.format_version <= FORMAT,
             "Unsupported data format version"
         );
+        // Older registries did not store the user ID; recover it from their saved login.
+        for p in &mut registry.accounts {
+            if p.user_id.is_none()
+                && let Ok(bytes) = platform::read(
+                    &root
+                        .join("accounts")
+                        .join(p.id.to_string())
+                        .join("auth.json"),
+                )
+                && let Ok(actual) = identity(&bytes)
+                && actual.account_id == p.account_id
+                && (p.email.is_none() || actual.matches(p))
+            {
+                p.user_id = actual.user_id;
+            }
+        }
         validate_registry(&registry)?;
         let (settings, settings_warning) =
             load_recovered(&root.join("settings.json"), |value: &Settings| {
@@ -122,8 +138,27 @@ impl Store {
         }
         let bytes = platform::read(&self.active_file())?;
         let current = identity(&bytes)?;
+        ensure!(
+            current.user_id.is_some() || current.email.is_some(),
+            "Credential user identity unavailable. Sign in again."
+        );
         let mut r = self.registry.clone();
-        let id = if let Some(p) = r.accounts.iter().find(|p| current.matches(p)) {
+        let index = r
+            .active_account_id
+            .and_then(|id| {
+                r.accounts
+                    .iter()
+                    .position(|p| p.id == id && current.matches(p))
+            })
+            .or_else(|| r.accounts.iter().position(|p| current.matches(p)));
+        let id = if let Some(index) = index {
+            let p = &mut r.accounts[index];
+            if current.user_id.is_some() {
+                p.user_id = current.user_id.clone();
+            }
+            if current.email.is_some() {
+                p.email = current.email.clone();
+            }
             p.id
         } else {
             let p = current.profile();
@@ -131,8 +166,9 @@ impl Store {
             r.accounts.push(p);
             id
         };
-        platform::atomic_write(&self.credential(id), &bytes)?;
         r.active_account_id = Some(id);
+        validate_registry(&r)?;
+        platform::atomic_write(&self.credential(id), &bytes)?;
         self.save_registry(r)
     }
     pub fn add(&mut self, profile: Profile) -> Result<()> {
@@ -305,6 +341,9 @@ impl Store {
             if p.account_id.is_none() {
                 p.account_id = actual.account_id.clone();
             }
+            if p.user_id.is_none() && (p.email.is_none() || actual.matches(p)) {
+                p.user_id = actual.user_id.clone();
+            }
             ensure!(actual.matches(p), "Imported credential identity mismatch");
             credentials.push((p.id, bytes));
         }
@@ -327,6 +366,7 @@ impl Store {
         for p in &data.registry.accounts {
             let i = Identity {
                 account_id: p.account_id.clone(),
+                user_id: p.user_id.clone(),
                 email: p.email.clone(),
             };
             if self.registry.accounts.iter().any(|p| i.matches(p)) {
@@ -365,6 +405,7 @@ impl Store {
             for p in &data.registry.accounts {
                 let i = Identity {
                     account_id: p.account_id.clone(),
+                    user_id: p.user_id.clone(),
                     email: p.email.clone(),
                 };
                 if registry.accounts.iter().any(|p| i.matches(p)) {
@@ -502,12 +543,13 @@ fn validate_registry(r: &Registry) -> Result<()> {
         );
         let i = Identity {
             account_id: p.account_id.clone(),
+            user_id: p.user_id.clone(),
             email: p.email.clone(),
         };
-        if r.accounts
-            .iter()
-            .any(|other| other.id != p.id && i.matches(other))
-        {
+        // Older versions could save the same user twice after an email change.
+        if r.accounts.iter().any(|other| {
+            other.id != p.id && i.matches(other) && (p.user_id.is_none() || other.user_id.is_none())
+        }) {
             bail!("Duplicate account identity");
         }
     }
@@ -626,14 +668,142 @@ pub fn switch(
 mod tests {
     use super::*;
 
+    fn credential(account_id: &str, user_id: &str, email: Option<&str>) -> Vec<u8> {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let claims = serde_json::json!({
+            "email": email,
+            "https://api.openai.com/auth": {"chatgpt_user_id": user_id}
+        });
+        serde_json::to_vec(&serde_json::json!({"tokens": {
+            "account_id": account_id,
+            "id_token": format!("a.{}.b", URL_SAFE_NO_PAD.encode(claims.to_string()))
+        }}))
+        .unwrap()
+    }
+
     fn saved_account(store: &mut Store, account_id: &str) -> Profile {
-        let bytes =
-            serde_json::to_vec(&serde_json::json!({"tokens":{"account_id":account_id}})).unwrap();
+        let bytes = credential(account_id, "test-user", None);
         let mut profile = identity(&bytes).unwrap().profile();
         profile.display_name = "Same name".into();
         platform::atomic_write(&store.credential(profile.id), &bytes).unwrap();
         store.add(profile.clone()).unwrap();
         profile
+    }
+
+    #[test]
+    fn sync_preserves_workspace_users_and_migrates_old_profiles() {
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("switcher-identities-{}", Uuid::new_v4()));
+        let mut store = Store::load(root.join("store"), root.join("active")).unwrap();
+        let alice = credential("workspace", "alice", Some("old@example.test"));
+        platform::atomic_write(&store.active_file(), &alice).unwrap();
+        store.sync_current().unwrap();
+        let alice_id = store.registry.active_account_id.unwrap();
+
+        let mut legacy = store.registry.clone();
+        legacy.accounts[0].user_id = None;
+        store.save_registry(legacy).unwrap();
+        drop(store);
+        let mut store = Store::load(root.join("store"), root.join("active")).unwrap();
+        assert_eq!(store.registry.accounts[0].user_id.as_deref(), Some("alice"));
+
+        let renamed = credential("workspace", "alice", Some("new@example.test"));
+        platform::atomic_write(&store.active_file(), &renamed).unwrap();
+        store.sync_current().unwrap();
+        assert_eq!(store.registry.accounts.len(), 1);
+        assert_eq!(store.registry.active_account_id, Some(alice_id));
+        assert_eq!(
+            store.registry.accounts[0].email.as_deref(),
+            Some("new@example.test")
+        );
+
+        let bob = credential("workspace", "bob", None);
+        platform::atomic_write(&store.active_file(), &bob).unwrap();
+        store.sync_current().unwrap();
+        assert_eq!(store.registry.accounts.len(), 2);
+        assert_ne!(store.registry.active_account_id, Some(alice_id));
+        assert_eq!(
+            platform::read(&store.credential(alice_id)).unwrap(),
+            renamed
+        );
+
+        platform::atomic_write(
+            &store.active_file(),
+            br#"{"tokens":{"account_id":"workspace"}}"#,
+        )
+        .unwrap();
+        assert!(store.sync_current().is_err());
+        assert_eq!(store.registry.accounts.len(), 2);
+        assert_eq!(
+            platform::read(&store.credential(alice_id)).unwrap(),
+            renamed
+        );
+        platform::remove_tree(&root, &temp).unwrap();
+    }
+
+    #[test]
+    fn legacy_duplicate_users_remain_accessible_and_removable() {
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("switcher-duplicates-{}", Uuid::new_v4()));
+        let mut store = Store::load(root.join("store"), root.join("active")).unwrap();
+        let old = credential("workspace", "alice", Some("old@example.test"));
+        let renamed = credential("workspace", "alice", Some("new@example.test"));
+        let mut first = identity(&old).unwrap().profile();
+        let mut second = identity(&renamed).unwrap().profile();
+        first.user_id = None;
+        second.user_id = None;
+        platform::atomic_write(&store.credential(first.id), &old).unwrap();
+        platform::atomic_write(&store.credential(second.id), &renamed).unwrap();
+        platform::atomic_write(&store.active_file(), &renamed).unwrap();
+        store
+            .save_registry(Registry {
+                format_version: FORMAT,
+                active_account_id: Some(first.id),
+                accounts: vec![first.clone(), second.clone()],
+            })
+            .unwrap();
+        drop(store);
+
+        let mut store = Store::load(root.join("store"), root.join("active")).unwrap();
+        store.sync_current().unwrap();
+        assert_eq!(store.registry.active_account_id, Some(first.id));
+        assert_eq!(store.registry.accounts.len(), 2);
+        assert_ne!(
+            store.registry.label(&store.registry.accounts[0]),
+            store.registry.label(&store.registry.accounts[1])
+        );
+        store.remove(second.id).unwrap();
+        assert_eq!(store.registry.accounts.len(), 1);
+        assert_eq!(
+            platform::read(&store.credential(first.id)).unwrap(),
+            renamed
+        );
+        platform::remove_tree(&root, &temp).unwrap();
+    }
+
+    #[test]
+    fn legacy_profile_does_not_adopt_an_unverifiable_user_id() {
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("switcher-legacy-identity-{}", Uuid::new_v4()));
+        let mut source = Store::load(root.join("source"), root.join("unused")).unwrap();
+        let alice = credential("workspace", "alice", Some("alice@example.test"));
+        let mut profile = identity(&alice).unwrap().profile();
+        profile.user_id = None;
+        let bob = credential("workspace", "bob", None);
+        platform::atomic_write(&source.credential(profile.id), &bob).unwrap();
+        source
+            .save_registry(Registry {
+                format_version: FORMAT,
+                active_account_id: None,
+                accounts: vec![profile],
+            })
+            .unwrap();
+        let loaded = Store::load(source.root.clone(), source.active.clone()).unwrap();
+        assert!(loaded.registry.accounts[0].user_id.is_none());
+        let destination = Store::load(root.join("destination"), root.join("active")).unwrap();
+        assert!(destination.preview(&source.root).is_err());
+        assert!(destination.registry.accounts.is_empty());
+        platform::remove_tree(&root, &temp).unwrap();
     }
 
     #[test]
@@ -677,8 +847,8 @@ mod tests {
         let temp = std::env::temp_dir();
         let root = temp.join(format!("switcher-removal-{}", Uuid::new_v4()));
         let mut store = Store::load(root.join("store"), root.join("active")).unwrap();
-        let active = br#"{"tokens":{"account_id":"active"}}"#;
-        platform::atomic_write(&store.active_file(), active).unwrap();
+        let active = credential("active", "test-user", None);
+        platform::atomic_write(&store.active_file(), &active).unwrap();
         store.sync_current().unwrap();
         let profile = saved_account(&mut store, "inactive");
         let credential = platform::read(&store.credential(profile.id)).unwrap();
@@ -732,7 +902,7 @@ mod tests {
         profile.account_id = Some("workspace-two".into());
         platform::atomic_write(
             &source.credential(profile.id),
-            br#"{"tokens":{"account_id":"workspace-two"}}"#,
+            &credential("workspace-two", "test-user", None),
         )
         .unwrap();
         let mut registry = source.registry.clone();
@@ -768,8 +938,8 @@ mod tests {
         let root = temp.join(format!("switcher-import-{}", Uuid::new_v4()));
         let mut destination = Store::load(root.join("destination"), root.join("active")).unwrap();
         let mut source = Store::load(root.join("source"), root.join("unused")).unwrap();
-        let active = br#"{"tokens":{"account_id":"original"}}"#;
-        platform::atomic_write(&destination.active_file(), active).unwrap();
+        let active = credential("original", "test-user", None);
+        platform::atomic_write(&destination.active_file(), &active).unwrap();
         destination.sync_current().unwrap();
         destination.save_settings(Settings::default()).unwrap();
         write(
@@ -786,7 +956,7 @@ mod tests {
                 imported.id,
                 Usage {
                     remaining_percent: 23,
-                    resets_at: Utc::now(),
+                    resets_at: Some(Utc::now()),
                     five_hour_remaining_percent: None,
                     five_hour_resets_at: None,
                     reset_credits_remaining: None,

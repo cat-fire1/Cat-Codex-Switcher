@@ -267,36 +267,99 @@ pub struct Instance {
     mutex: HANDLE,
     activate: HANDLE,
 }
-pub struct OriginalGuard(HANDLE);
+pub struct OriginalGuard(Vec<HANDLE>);
 impl OriginalGuard {
     pub fn acquire(data: &Path) -> Result<Self> {
         use sha2::{Digest, Sha256};
-        let absolute = if data.is_absolute() {
-            data.to_owned()
-        } else {
-            std::env::current_dir()?.join(data)
-        };
-        let hash = Sha256::digest(
-            absolute
-                .to_string_lossy()
-                .replace('/', "\\")
-                .to_uppercase()
-                .as_bytes(),
+        use std::os::windows::ffi::OsStringExt;
+        let input = wide(data);
+        let needed = unsafe { GetFullPathNameW(PCWSTR(input.as_ptr()), None, None) };
+        anyhow::ensure!(needed > 0, "Cannot resolve original data path");
+        let mut buffer = vec![0u16; needed as usize];
+        let length = unsafe { GetFullPathNameW(PCWSTR(input.as_ptr()), Some(&mut buffer), None) };
+        anyhow::ensure!(
+            length > 0 && length < needed,
+            "Cannot resolve original data path"
         );
-        let name = wide(format!("Local\\CodexAccountSwitcher-{hash:X}"));
-        unsafe {
-            let handle = CreateMutexW(None, true, PCWSTR(name.as_ptr()))?;
-            if GetLastError() == ERROR_ALREADY_EXISTS {
-                let wait = WaitForSingleObject(handle, 0);
-                if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
-                    let _ = CloseHandle(handle);
-                    bail!(
-                        "Quit the original Codex Account Switcher before using account operations or importing its data."
-                    );
-                }
+        let absolute: PathBuf =
+            PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length as usize]))
+                .components()
+                .collect();
+        use windows::Win32::Globalization::{
+            LCMAP_UPPERCASE, LCMapStringEx, LOCALE_NAME_INVARIANT,
+        };
+        let source: Vec<u16> = absolute
+            .to_string_lossy()
+            .replace('/', "\\")
+            .encode_utf16()
+            .collect();
+        // Match the original app's invariant casing, which does not expand characters such as ß.
+        let needed = unsafe {
+            LCMapStringEx(
+                LOCALE_NAME_INVARIANT,
+                LCMAP_UPPERCASE,
+                &source,
+                None,
+                None,
+                None,
+                LPARAM(0),
+            )
+        };
+        anyhow::ensure!(needed > 0, "Cannot normalize original data path");
+        let mut uppercase = vec![0u16; needed as usize];
+        let length = unsafe {
+            LCMapStringEx(
+                LOCALE_NAME_INVARIANT,
+                LCMAP_UPPERCASE,
+                &source,
+                Some(&mut uppercase),
+                None,
+                None,
+                LPARAM(0),
+            )
+        };
+        anyhow::ensure!(length > 0, "Cannot normalize original data path");
+        let absolute = String::from_utf16_lossy(&uppercase[..length as usize]);
+        let regular = if let Some(path) = absolute.strip_prefix("\\\\?\\UNC\\") {
+            format!("\\\\{path}")
+        } else if absolute.starts_with("\\\\?\\") && absolute.as_bytes().get(5) == Some(&b':') {
+            absolute[4..].to_owned()
+        } else {
+            absolute
+        };
+        let extended = if let Some(path) = regular.strip_prefix("\\\\") {
+            Some(format!("\\\\?\\UNC\\{path}"))
+        } else if regular.as_bytes().get(1) == Some(&b':') {
+            Some(format!("\\\\?\\{regular}"))
+        } else {
+            None
+        };
+        let mut paths = Vec::new();
+        for path in [Some(regular), extended].into_iter().flatten() {
+            if !path.ends_with('\\') {
+                paths.push(format!("{path}\\"));
             }
-            Ok(Self(handle))
+            paths.push(path);
         }
+        let mut guard = Self(Vec::new());
+        for path in paths {
+            let hash = Sha256::digest(path.as_bytes());
+            let name = wide(format!("Local\\CodexAccountSwitcher-{hash:X}"));
+            unsafe {
+                let handle = CreateMutexW(None, true, PCWSTR(name.as_ptr()))?;
+                if GetLastError() == ERROR_ALREADY_EXISTS {
+                    let wait = WaitForSingleObject(handle, 0);
+                    if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+                        let _ = CloseHandle(handle);
+                        bail!(
+                            "Quit the original Codex Account Switcher before using account operations or importing its data."
+                        );
+                    }
+                }
+                guard.0.push(handle);
+            }
+        }
+        Ok(guard)
     }
     pub fn default_location() -> Result<Self> {
         Self::acquire(
@@ -308,9 +371,11 @@ impl OriginalGuard {
 }
 impl Drop for OriginalGuard {
     fn drop(&mut self) {
-        unsafe {
-            let _ = ReleaseMutex(self.0);
-            let _ = CloseHandle(self.0);
+        for handle in self.0.drain(..).rev() {
+            unsafe {
+                let _ = ReleaseMutex(handle);
+                let _ = CloseHandle(handle);
+            }
         }
     }
 }
@@ -626,6 +691,58 @@ impl Desktop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn original_guard_blocks_equivalent_paths_across_processes() {
+        if let Some(path) = std::env::var_os("SWITCHER_GUARD_TEST_PATH") {
+            assert!(OriginalGuard::acquire(Path::new(&path)).is_err());
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("switcher-guard-{}", uuid::Uuid::new_v4()));
+        let check_child = |path: &Path| {
+            hidden_command(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::tests::original_guard_blocks_equivalent_paths_across_processes",
+                ])
+                .env("SWITCHER_GUARD_TEST_PATH", path)
+                .status()
+                .unwrap()
+                .success()
+        };
+        {
+            let _guard = OriginalGuard::acquire(&root).unwrap();
+            for path in [
+                root.join("."),
+                root.join("subdir").join(".."),
+                PathBuf::from(format!("{}\\", root.display())),
+                PathBuf::from(format!("\\\\?\\{}", root.display())),
+            ] {
+                assert!(check_child(&path));
+            }
+        }
+        // The original app hashes Path.GetFullPath, which preserves a trailing slash.
+        use sha2::{Digest, Sha256};
+        for source in [
+            root.display().to_string(),
+            format!("{}\\", root.display()),
+            format!("\\\\?\\{}", root.display()),
+            format!("\\\\?\\{}\\", root.display()),
+        ] {
+            let hash = Sha256::digest(source.to_uppercase().as_bytes());
+            let name = wide(format!("Local\\CodexAccountSwitcher-{hash:X}"));
+            let handle = unsafe { CreateMutexW(None, true, PCWSTR(name.as_ptr())) }.unwrap();
+            let _original = OriginalGuard(vec![handle]);
+            assert!(check_child(&root));
+        }
+        let id = uuid::Uuid::new_v4().to_string().to_uppercase();
+        let original = format!("C:\\AUDIT\\STRAßE-{id}");
+        let hash = Sha256::digest(original.as_bytes());
+        let name = wide(format!("Local\\CodexAccountSwitcher-{hash:X}"));
+        let handle = unsafe { CreateMutexW(None, true, PCWSTR(name.as_ptr())) }.unwrap();
+        let _original = OriginalGuard(vec![handle]);
+        assert!(check_child(Path::new(&format!("C:\\audit\\Straße-{id}"))));
+    }
 
     #[test]
     fn external_write_keeps_the_external_directory_acl() {

@@ -219,8 +219,14 @@ impl Session {
         self.request("account/rateLimits/read", json!({})).await?;
         Ok(())
     }
-    pub async fn usage(&mut self) -> Result<Usage> {
-        model::normalize(&self.request("account/rateLimits/read", json!({})).await?)
+    pub async fn usage(&mut self, profile: &Profile) -> Result<Usage> {
+        let value = self.request("account/rateLimits/read", json!({})).await?;
+        if let Some(account) = value.get("accountId").and_then(Value::as_str)
+            && let Some(expected) = &profile.account_id
+        {
+            ensure!(account == expected, "Usage account identity mismatch");
+        }
+        model::normalize(&value)
     }
 }
 pub async fn verify_login(
@@ -281,12 +287,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn browser_login_accepts_completion_before_start_response() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let root = std::env::temp_dir().join(format!("switcher-login-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let auth = json!({"tokens": {"account_id":"saved-id", "id_token":
+            "a.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF91c2VyX2lkIjoidGVzdC11c2VyIn19.b"}});
+        std::fs::write(root.join("auth.json"), auth.to_string()).unwrap();
+        let script = r#"
+            $reads = 0
+            while ($null -ne ($line = [Console]::ReadLine())) {
+                $request = ConvertFrom-Json -InputObject $line
+                if ($null -eq $request.id) { continue }
+                $result = '{}'
+                switch ($request.method) {
+                    'initialize' {}
+                    'account/login/start' {
+                        [Console]::WriteLine('{"method":"account/login/completed","params":{"success":true}}')
+                        $result = '{"authUrl":"https://example.test/login"}'
+                    }
+                    'account/read' { $result = '{"account":{"type":"chatgpt","id":"saved-id"}}' }
+                    'account/rateLimits/read' {
+                        $reads++
+                        $account = if ($reads -eq 1) { 'other' } else { 'saved-id' }
+                        $result = '{"accountId":"' + $account + '","rateLimits":{"primary":{"windowDurationMins":10080,"usedPercent":40,"resetsAt":null}}}'
+                    }
+                    default { exit 2 }
+                }
+                [Console]::WriteLine(('{"id":' + $request.id + ',"result":' + $result + '}'))
+            }
+        "#;
+        let exe = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let mut command = tokio::process::Command::new(exe);
+        command
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .creation_flags(0x08000000);
+        let mut opened = String::new();
+        let identity = rt.block_on(async {
+            let mut session = Session::start_command(command, Arc::new(AtomicBool::new(false)))
+                .await
+                .unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                session.login_with(&root, |url| {
+                    opened = url.to_owned();
+                    Ok(())
+                }),
+            )
+            .await
+            .expect("login completion was not delivered");
+            let identity = result.unwrap();
+            let profile = identity.profile();
+            assert!(
+                session
+                    .usage(&profile)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("identity mismatch")
+            );
+            assert_eq!(session.usage(&profile).await.unwrap().remaining_percent, 60);
+            session.stop().await;
+            identity
+        });
+        assert_eq!(opened, "https://example.test/login");
+        assert_eq!(identity.account_id.as_deref(), Some("saved-id"));
+        assert_eq!(identity.user_id.as_deref(), Some("test-user"));
+        std::fs::remove_file(root.join("auth.json")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
     fn verification_refreshes_auth_and_requires_a_live_authenticated_read() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let root = std::env::temp_dir().join(format!("switcher-rpc-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
-        let auth = br#"{"tokens":{"account_id":"saved-id","refresh_token":"old-fake-token"}}"#;
-        let profile = model::identity(auth).unwrap().profile();
+        let token = "a.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF91c2VyX2lkIjoidGVzdC11c2VyIn19.b";
+        let auth = json!({"tokens":{"account_id":"saved-id","refresh_token":"old-fake-token", "id_token":token}}).to_string();
+        let profile = model::identity(auth.as_bytes()).unwrap().profile();
         let log = root.join("requests.txt");
         let script = r#"
             $ErrorActionPreference = 'Stop'
@@ -338,10 +421,9 @@ mod tests {
             (json!({"type":"chatgpt"}), "refresh", "saved-id", false),
             (json!({"type":"chatgpt"}), "limits", "saved-id", false),
         ] {
-            std::fs::write(root.join("auth.json"), auth).unwrap();
+            std::fs::write(root.join("auth.json"), &auth).unwrap();
             std::fs::write(&log, b"").unwrap();
-            let rotated =
-                json!({"tokens":{"account_id":rotated_id,"refresh_token":"new-fake-token"}});
+            let rotated = json!({"tokens":{"account_id":rotated_id,"refresh_token":"new-fake-token", "id_token":token}});
             let exe = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
                 .join("System32/WindowsPowerShell/v1.0/powershell.exe");
             let mut command = tokio::process::Command::new(exe);
