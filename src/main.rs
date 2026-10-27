@@ -37,7 +37,7 @@ fn run() -> anyhow::Result<()> {
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Cat Codex Switcher")
-            .with_inner_size([420.0, 320.0])
+            .with_inner_size([520.0, 440.0])
             .with_clamp_size_to_monitor_size(false)
             .with_resizable(false)
             .with_maximize_button(false)

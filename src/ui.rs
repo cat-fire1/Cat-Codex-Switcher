@@ -44,6 +44,7 @@ impl App {
         background: bool,
     ) -> Self {
         win::install_fonts(&cc.egui_ctx);
+        cc.egui_ctx.set_theme(egui::Theme::Dark);
         win::configure(&cc.egui_ctx);
         let mut local_error = None;
         let state = Snapshot::default();
@@ -137,78 +138,109 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
     fn header(&mut self, ui: &mut egui::Ui, lang: &str) {
+        let p = Palette::current(ui);
         egui::Frame::new()
-            .inner_margin(egui::Margin {
-                left: 20,
-                right: 20,
-                top: 16,
-                bottom: 16,
-            })
+            .inner_margin(egui::Margin::symmetric(24, 22))
             .show(ui, |ui| {
-                ui.set_width(380.0);
-                if self.page == Page::Accounts {
-                    ui.horizontal(|ui| {
-                        ui.label(win::title(i18n::t(lang, "accounts"), 20.0));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_enabled_ui(!self.state.busy, |ui| {
-                                let settings = win::button(ui, "", Some('\u{e713}'))
-                                    .on_hover_text(i18n::t(lang, "settings"));
-                                settings.widget_info(|| {
-                                    egui::WidgetInfo::labeled(
-                                        egui::WidgetType::Button,
-                                        true,
-                                        i18n::t(lang, "settings"),
-                                    )
-                                });
-                                if self.state.update_url.is_some() {
-                                    ui.painter().circle_filled(
-                                        settings.rect.right_top() + egui::vec2(-7.0, 7.0),
-                                        2.5,
-                                        Palette::current(ui).accent,
-                                    );
+                ui.horizontal(|ui| {
+                    let (mark, _) =
+                        ui.allocate_exact_size(egui::vec2(38.0, 38.0), egui::Sense::hover());
+                    ui.painter().rect_filled(mark, 12, p.accent);
+                    ui.painter().text(
+                        mark.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "C",
+                        win::semibold(24.0),
+                        p.surface,
+                    );
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.label(win::title("Cat Codex", 20.0));
+                        win::muted(ui, "ACCOUNT SWITCHER", 9.5);
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.state.busy {
+                            ui.spinner().on_hover_text(i18n::t(lang, "refresh"));
+                        } else if win::button(ui, "", Some('\u{e72c}'))
+                            .on_hover_text(i18n::t(lang, "refresh"))
+                            .clicked()
+                        {
+                            self.send(Command::Refresh);
+                        }
+                    });
+                });
+                ui.add_space(22.0);
+                egui::Frame::new()
+                    .fill(p.list)
+                    .corner_radius(11)
+                    .inner_margin(5)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let width = (ui.available_width() - 8.0) / 3.0;
+                            for (page, key) in [
+                                (Page::Accounts, "accounts"),
+                                (Page::Manage, "manage"),
+                                (Page::Settings, "settings"),
+                            ] {
+                                let selected = self.page == page;
+                                let label =
+                                    if page == Page::Settings && self.state.update_url.is_some() {
+                                        format!("{} •", i18n::t(lang, key))
+                                    } else {
+                                        i18n::t(lang, key).to_owned()
+                                    };
+                                let response = ui.add_enabled(
+                                    !self.state.busy,
+                                    egui::Button::new(win::title(label, 12.0).color(if selected {
+                                        p.accent
+                                    } else {
+                                        p.muted
+                                    }))
+                                    .fill(if selected {
+                                        p.selected
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    })
+                                    .stroke(egui::Stroke::NONE)
+                                    .min_size(egui::vec2(width, 34.0)),
+                                );
+                                if response.clicked() {
+                                    self.page = page;
                                 }
-                                if settings.clicked() {
-                                    self.page = Page::Settings;
-                                }
-                                if win::button(ui, i18n::t(lang, "manage"), Some('\u{e716}'))
-                                    .clicked()
-                                {
-                                    self.page = Page::Manage;
-                                }
-                            });
+                            }
                         });
                     });
-                } else {
-                    let title = match self.page {
-                        Page::Settings => i18n::t(lang, "settings").to_owned(),
-                        Page::Switch(id) | Page::Remove(id) => {
-                            let name = self
-                                .state
-                                .rows
-                                .iter()
-                                .find(|r| r.profile.id == id)
-                                .map(|r| r.title.as_str())
-                                .unwrap_or("");
+                ui.add_space(22.0);
+                match self.page {
+                    Page::Accounts | Page::Manage | Page::Settings => {
+                        let key = match self.page {
+                            Page::Manage => "manage",
+                            Page::Settings => "settings",
+                            _ => "accounts",
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(win::title(i18n::t(lang, key), 22.0));
+                            if self.page != Page::Settings {
+                                win::muted(ui, format!("{:02}", self.state.rows.len()), 14.0);
+                            }
+                        });
+                        win::muted(
+                            ui,
                             i18n::t(
                                 lang,
-                                if matches!(self.page, Page::Remove(_)) {
-                                    "remove_title"
-                                } else {
-                                    "switch_title"
+                                match self.page {
+                                    Page::Manage => "manage_caption",
+                                    Page::Settings => "settings_caption",
+                                    _ => "accounts_caption",
                                 },
-                            )
-                            .replace("%@", name)
-                        }
-                        _ => i18n::t(lang, "accounts").to_owned(),
-                    };
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled_ui(!self.state.busy, |ui| {
-                                win::button(ui, "", Some('\u{e72b}'))
-                            })
-                            .inner
-                            .on_hover_text(i18n::t(lang, "back"))
-                            .clicked()
+                            ),
+                            12.0,
+                        );
+                    }
+                    Page::Switch(id) | Page::Remove(id) => {
+                        if win::button(ui, i18n::t(lang, "back"), Some('\u{e72b}')).clicked()
+                            && !self.state.busy
                         {
                             self.page = if matches!(self.page, Page::Remove(_)) {
                                 Page::Manage
@@ -216,9 +248,27 @@ impl App {
                                 Page::Accounts
                             };
                         }
-                        ui.add_space(4.0);
-                        win::ellipsis(ui, &title, ui.available_width(), 20.0, true, false);
-                    });
+                        ui.add_space(12.0);
+                        let name = self
+                            .state
+                            .rows
+                            .iter()
+                            .find(|r| r.profile.id == id)
+                            .map(|r| r.title.as_str())
+                            .unwrap_or("");
+                        let key = if matches!(self.page, Page::Remove(_)) {
+                            "remove_title"
+                        } else {
+                            "switch_title"
+                        };
+                        ui.add(
+                            egui::Label::new(win::title(
+                                i18n::t(lang, key).replace("%@", name),
+                                20.0,
+                            ))
+                            .wrap(),
+                        );
+                    }
                 }
             });
     }
@@ -226,8 +276,8 @@ impl App {
         let p = Palette::current(ui);
         egui::Frame::new()
             .inner_margin(egui::Margin {
-                left: 20,
-                right: 20,
+                left: 24,
+                right: 24,
                 top: 0,
                 bottom: 20,
             })
@@ -240,32 +290,43 @@ impl App {
                     ui.add_space(8.0);
                 }
                 egui::Frame::new()
-                    .fill(p.list)
-                    .stroke(egui::Stroke::new(1.0_f32, p.line))
-                    .corner_radius(4)
+                    .fill(Color32::TRANSPARENT)
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.spacing_mut().item_spacing.y = 10.0;
                         if self.state.rows.is_empty() {
                             egui::Frame::new()
-                                .inner_margin(egui::Margin::symmetric(12, 24))
+                                .inner_margin(egui::Margin::symmetric(22, 32))
                                 .show(ui, |ui| {
+                                    ui.label(win::title(i18n::t(lang, "welcome"), 18.0));
+                                    ui.add_space(8.0);
                                     win::muted(ui, i18n::t(lang, "empty"), 12.0);
+                                    ui.add_space(18.0);
+                                    if ui
+                                        .add_enabled_ui(!self.state.busy, |ui| {
+                                            win::primary_button(ui, i18n::t(lang, "add"))
+                                        })
+                                        .inner
+                                        .clicked()
+                                    {
+                                        self.page = Page::Manage;
+                                        self.send(Command::Add);
+                                    }
                                 });
                         }
                         for row in self.state.rows.clone() {
                             let active = self.state.active == Some(row.profile.id);
                             let row_height = if manage {
-                                56.0
+                                68.0
                             } else if self.state.settings.shows_five_hour_usage
                                 && row
                                     .usage
                                     .as_ref()
                                     .is_some_and(|u| u.five_hour_remaining_percent.is_some())
                             {
-                                94.0
+                                160.0
                             } else {
-                                74.0
+                                122.0
                             };
                             let (rect, response) = ui.allocate_exact_size(
                                 egui::vec2(ui.available_width(), row_height),
@@ -280,20 +341,33 @@ impl App {
                             } else if !manage && active {
                                 p.selected
                             } else {
-                                Color32::TRANSPARENT
+                                p.list
                             };
-                            ui.painter().rect_filled(rect, 0, fill);
+                            ui.painter().rect_filled(rect, 12, fill);
+                            ui.painter().rect_stroke(
+                                rect,
+                                12,
+                                egui::Stroke::new(
+                                    1.0_f32,
+                                    if active {
+                                        p.accent.gamma_multiply(0.5)
+                                    } else {
+                                        p.line
+                                    },
+                                ),
+                                egui::StrokeKind::Inside,
+                            );
                             if !manage && active {
                                 let stripe = egui::Rect::from_center_size(
                                     egui::pos2(rect.left() + 1.5, rect.center().y),
                                     egui::vec2(3.0, 24.0),
                                 );
-                                ui.painter().rect_filled(stripe, 0, p.accent);
+                                ui.painter().rect_filled(stripe, 2, p.accent);
                             }
                             if !manage && response.has_focus() {
                                 ui.painter().rect_stroke(
                                     rect,
-                                    0,
+                                    12,
                                     egui::Stroke::new(1.0_f32, p.accent),
                                     egui::StrokeKind::Inside,
                                 );
@@ -316,11 +390,14 @@ impl App {
                             };
                             let content = rect.shrink2(egui::vec2(16.0, 12.0));
                             let avatar = egui::Rect::from_center_size(
-                                egui::pos2(content.left() + 16.0, rect.center().y),
-                                egui::vec2(32.0, 32.0),
+                                egui::pos2(content.left() + 18.0, content.top() + 20.0),
+                                egui::vec2(36.0, 36.0),
                             );
-                            ui.painter()
-                                .rect_filled(avatar, 4, p.hover.gamma_multiply(opacity));
+                            ui.painter().rect_filled(
+                                avatar,
+                                12,
+                                p.selected.gamma_multiply(opacity),
+                            );
                             if !manage && row.stale && row.usage.is_some() {
                                 ui.painter().circle_filled(
                                     avatar.right_top() + egui::vec2(-2.0, 2.0),
@@ -334,10 +411,10 @@ impl App {
                                 egui::Align2::CENTER_CENTER,
                                 initials,
                                 win::semibold(11.0),
-                                p.ink.gamma_multiply(opacity),
+                                p.accent.gamma_multiply(opacity),
                             );
                             let detail = egui::Rect::from_min_max(
-                                egui::pos2(content.left() + 44.0, content.top()),
+                                egui::pos2(content.left() + 50.0, content.top()),
                                 content.max,
                             );
                             let mut detail_ui = ui.new_child(
@@ -352,6 +429,7 @@ impl App {
 
                                 ui.set_opacity(opacity);
                                 ui.spacing_mut().interact_size.y = 0.0;
+                                ui.spacing_mut().item_spacing.y = 0.0;
                                 if manage {
                                     ui.allocate_ui_with_layout(
                                         egui::vec2(detail.width(), 32.0),
@@ -455,6 +533,14 @@ impl App {
                                             .on_hover_text(row.error.as_deref().unwrap_or(""));
                                     }
                                     account_info(ui, &row, lang);
+                                    if active {
+                                        ui.add_space(5.0);
+                                        ui.label(
+                                            RichText::new(format!("● {}", i18n::t(lang, "active")))
+                                                .size(10.0)
+                                                .color(p.accent),
+                                        );
+                                    }
                                 }
                             }
                             if row.stale {
@@ -480,14 +566,9 @@ impl App {
                     ui.horizontal(|ui| {
                         let add = ui
                             .add_enabled_ui(self.state.adding || !self.state.busy, |ui| {
-                                win::button(
+                                win::primary_button(
                                     ui,
                                     i18n::t(lang, if self.state.adding { "cancel" } else { "add" }),
-                                    Some(if self.state.adding {
-                                        '\u{e711}'
-                                    } else {
-                                        '\u{e710}'
-                                    }),
                                 )
                             })
                             .inner;
@@ -569,10 +650,18 @@ impl App {
     fn settings(&mut self, ui: &mut egui::Ui, lang: &str) {
         let mut s = self.state.settings.clone();
         egui::Frame::new()
-            .inner_margin(egui::Margin {
-                left: 20,
-                right: 20,
+            .fill(Palette::current(ui).list)
+            .corner_radius(14)
+            .outer_margin(egui::Margin {
+                left: 24,
+                right: 24,
                 top: 0,
+                bottom: 24,
+            })
+            .inner_margin(egui::Margin {
+                left: 24,
+                right: 24,
+                top: 20,
                 bottom: 20,
             })
             .show(ui, |ui| {
@@ -727,8 +816,8 @@ impl App {
         }
         egui::Frame::new()
             .inner_margin(egui::Margin {
-                left: 20,
-                right: 20,
+                left: 24,
+                right: 24,
                 top: 0,
                 bottom: 20,
             })
@@ -743,20 +832,20 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let p = Palette::current(ui);
                         let confirm = ui
-                            .scope(|ui| {
-                                ui.visuals_mut().widgets.inactive.bg_stroke =
-                                    egui::Stroke::new(1.0_f32, p.accent);
-                                ui.add_enabled_ui(!self.state.busy, |ui| {
-                                    win::button(
-                                        ui,
-                                        i18n::t(
-                                            lang,
-                                            if remove { "remove" } else { "switch_action" },
-                                        ),
-                                        None,
+                            .add_enabled_ui(!self.state.busy, |ui| {
+                                if remove {
+                                    ui.add(
+                                        egui::Button::new(
+                                            win::title(i18n::t(lang, "remove"), 13.0)
+                                                .color(p.surface),
+                                        )
+                                        .fill(Color32::from_rgb(240, 139, 133))
+                                        .stroke(egui::Stroke::NONE)
+                                        .min_size(egui::vec2(36.0, 36.0)),
                                     )
-                                })
-                                .inner
+                                } else {
+                                    win::primary_button(ui, i18n::t(lang, "switch_action"))
+                                }
                             })
                             .inner;
                         let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -840,6 +929,13 @@ impl eframe::App for App {
                             .or_else(|| self.state.error.clone())
                         {
                             egui::Frame::new()
+                                .fill(Palette::current(ui).list)
+                                .stroke(egui::Stroke::new(
+                                    1.0_f32,
+                                    Color32::from_rgb(240, 139, 133),
+                                ))
+                                .corner_radius(12)
+                                .outer_margin(egui::Margin::symmetric(24, 12))
                                 .inner_margin(egui::Margin::symmetric(12, 8))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
@@ -881,13 +977,17 @@ impl eframe::App for App {
         let height = if self.fitted_height > 0.0
             && (self.state.adding || self.local_error.is_some() || self.state.error.is_some())
         {
-            self.fitted_height.clamp(130.0, maximum)
+            self.fitted_height.clamp(440.0_f32.min(maximum), maximum)
         } else {
-            panel.inner.content_size.y.clamp(130.0, maximum)
+            panel
+                .inner
+                .content_size
+                .y
+                .clamp(440.0_f32.min(maximum), maximum)
         };
         if (height - self.fitted_height).abs() > 0.5 {
             self.fitted_height = height;
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(420.0, height)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(520.0, height)));
         }
         if let Some(preview) = self.state.preview.clone() {
             let mut open = true;
@@ -978,50 +1078,42 @@ fn usage_line(ui: &mut egui::Ui, title: &str, percent: i32, reset: Option<String
     } else {
         format!("{percent}{}", i18n::t(lang, "left"))
     };
-    let size = if reset.is_some() { 9.5 } else { 10.5 };
-    let font = egui::FontId::proportional(size);
-    let label_font = egui::FontId::proportional(10.5);
-    let label_width = ui
-        .painter()
-        .layout_no_wrap(title.into(), label_font.clone(), p.muted)
-        .size()
-        .x;
-    let right_width = ui
-        .painter()
-        .layout_no_wrap(right.clone(), font.clone(), p.muted)
-        .size()
-        .x;
+    let font = egui::FontId::proportional(10.5);
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 14.0), egui::Sense::hover());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
     ui.painter().text(
-        rect.left_center(),
-        egui::Align2::LEFT_CENTER,
+        rect.left_top(),
+        egui::Align2::LEFT_TOP,
         title,
-        label_font,
+        font.clone(),
         p.muted,
     );
     ui.painter().text(
-        rect.right_center(),
-        egui::Align2::RIGHT_CENTER,
+        rect.right_top(),
+        egui::Align2::RIGHT_TOP,
         right,
         font,
-        p.muted,
+        p.ink,
     );
     let track = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + label_width + 7.0, rect.center().y - 2.0),
-        egui::pos2(
-            (rect.right() - right_width - 7.0).max(rect.left() + label_width + 7.0),
-            rect.center().y + 2.0,
-        ),
+        egui::pos2(rect.left(), rect.bottom() - 7.0),
+        rect.right_bottom(),
     );
-    ui.painter().rect_filled(track, 1, p.line);
+    let color = if percent <= 10 {
+        Color32::from_rgb(240, 139, 133)
+    } else if percent <= 25 {
+        Color32::from_rgb(231, 194, 122)
+    } else {
+        p.accent
+    };
+    ui.painter().rect_filled(track, 4, p.line);
     ui.painter().rect_filled(
         egui::Rect::from_min_size(
             track.min,
-            egui::vec2(track.width() * percent as f32 / 100.0, 4.0),
+            egui::vec2(track.width() * percent.clamp(0, 100) as f32 / 100.0, 7.0),
         ),
-        1,
-        p.accent,
+        4,
+        color,
     );
     response.widget_info(|| {
         egui::WidgetInfo::labeled(
@@ -1096,6 +1188,107 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize},
         mpsc,
     };
+
+    #[test]
+    fn redesigned_pages_fit_the_window_in_all_languages() {
+        let ctx = egui::Context::default();
+        win::install_fonts(&ctx);
+        ctx.set_theme(egui::Theme::Dark);
+        win::configure(&ctx);
+        let id = Uuid::new_v4();
+        let state = Snapshot {
+            busy: false,
+            active: Some(id),
+            rows: vec![crate::worker::Row {
+                profile: crate::model::Profile {
+                    id,
+                    display_name: "A very long workspace name".into(),
+                    email: None,
+                    account_id: None,
+                    created_at: Utc::now(),
+                    last_used_at: None,
+                },
+                title: "long.account.name+workspace@example.com".into(),
+                usage: Some(crate::model::Usage {
+                    remaining_percent: 22,
+                    resets_at: Utc::now(),
+                    five_hour_remaining_percent: Some(94),
+                    five_hour_resets_at: Some(Utc::now()),
+                    reset_credits_remaining: Some(3),
+                    reset_credits: None,
+                }),
+                stale: true,
+                fetched_at: Some(Utc::now()),
+                error: None,
+                subscription: Some((Utc::now(), Utc::now())),
+            }],
+            ..Default::default()
+        };
+        let mut app = App {
+            shared: Arc::new(Mutex::new(state.clone())),
+            state,
+            worker: None,
+            _instance: None,
+            tray: None,
+            page: Page::Accounts,
+            repository: String::new(),
+            import_path: String::new(),
+            exit: false,
+            initial_hide: false,
+            local_error: None,
+            fitted_height: 0.0,
+        };
+        for lang in ["uk", "en", "ru"] {
+            for show_five in [false, true] {
+                app.state.settings.shows_five_hour_usage = show_five;
+                for page in [
+                    Page::Accounts,
+                    Page::Manage,
+                    Page::Settings,
+                    Page::Switch(id),
+                    Page::Remove(id),
+                ] {
+                    app.page = page;
+                    // A second pass lets egui settle automatic layout measurements.
+                    for _ in 0..2 {
+                        let _ = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(520.0, 1200.0),
+                                )),
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                    ctx,
+                                    |ui| {
+                                        app.header(ui, lang);
+                                        match app.page {
+                                            Page::Accounts => app.accounts(ui, lang, false),
+                                            Page::Manage => app.accounts(ui, lang, true),
+                                            Page::Settings => app.settings(ui, lang),
+                                            Page::Switch(id) => {
+                                                app.confirmation(ui, lang, id, false)
+                                            }
+                                            Page::Remove(id) => {
+                                                app.confirmation(ui, lang, id, true)
+                                            }
+                                        }
+                                        assert!(
+                                            ui.min_rect().right() <= 520.5,
+                                            "{lang}: content exceeds window: {:?}",
+                                            ui.min_rect()
+                                        );
+                                    },
+                                );
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn disconnected_worker_does_not_block_quit() {

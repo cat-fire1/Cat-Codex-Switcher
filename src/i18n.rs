@@ -14,6 +14,27 @@ pub fn language(value: &str) -> String {
 }
 pub fn t<'a>(language: &str, key: &'a str) -> &'a str {
     let words = match key {
+        "welcome" => [
+            "Усі акаунти. Одне місце.",
+            "All accounts. One place.",
+            "Все аккаунты. Одно место.",
+        ],
+        "accounts_caption" => [
+            "Ліміти під рукою. Оберіть акаунт для перемикання.",
+            "Usage at a glance. Select an account to switch.",
+            "Лимиты под рукой. Выберите аккаунт для переключения.",
+        ],
+        "manage_caption" => [
+            "Додавайте входи та керуйте збереженими акаунтами.",
+            "Add logins and manage your saved accounts.",
+            "Добавляйте входы и управляйте сохранёнными аккаунтами.",
+        ],
+        "settings_caption" => [
+            "Налаштуйте Switcher під свій робочий ритм.",
+            "Make Switcher fit the way you work.",
+            "Настройте Switcher под свой рабочий ритм.",
+        ],
+        "refresh" => ["Оновити ліміти", "Refresh usage", "Обновить лимиты"],
         "accounts" => ["Акаунти", "Accounts", "Аккаунты"],
         "manage" => ["Керування", "Manage", "Управление"],
         "settings" => ["Налаштування", "Settings", "Настройки"],
