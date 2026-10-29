@@ -72,13 +72,7 @@ impl Store {
                 Ok(())
             })?;
         let (cache, cache_warning) =
-            load_recovered(&root.join("usage-cache.json"), |value: &Cache| {
-                ensure!(
-                    value.format_version <= FORMAT,
-                    "Unsupported data format version"
-                );
-                Ok(())
-            })?;
+            load_recovered(&root.join("usage-cache.json"), Cache::validate)?;
         let warnings: Vec<_> = [settings_warning, cache_warning]
             .into_iter()
             .flatten()
@@ -114,6 +108,7 @@ impl Store {
         Ok(())
     }
     pub fn cache(&mut self, id: Uuid, usage: Usage) -> Result<()> {
+        usage.validate()?;
         let mut cache = self.cache.clone();
         cache.format_version = FORMAT;
         cache.entries.retain(|e| e.profile_id != id);
@@ -323,9 +318,10 @@ impl Store {
         let settings: Settings = load_or(&source.join("settings.json"))?;
         let cache: Cache = load_or(&source.join("usage-cache.json"))?;
         ensure!(
-            settings.format_version <= FORMAT && cache.format_version <= FORMAT,
+            settings.format_version <= FORMAT,
             "Unsupported import format"
         );
+        cache.validate()?;
         let mut credentials = Vec::new();
         for p in &mut registry.accounts {
             let lower = source
@@ -836,6 +832,89 @@ mod tests {
             Err(error) => format!("{error:#}"),
         };
         assert!(error.contains("Rename or delete"));
+        platform::remove_tree(&root, &temp).unwrap();
+    }
+
+    #[test]
+    fn invalid_usage_is_not_saved_and_corrupt_cache_is_backed_up() {
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("switcher-cache-validation-{}", Uuid::new_v4()));
+        let mut store = Store::load(root.join("store"), root.join("active")).unwrap();
+        let profile = saved_account(&mut store, "workspace");
+        let valid: Usage = serde_json::from_value(serde_json::json!({
+            "remainingPercent": 100, "fiveHourRemainingPercent": 0,
+            "resetCreditsRemaining": 0
+        }))
+        .unwrap();
+        store.cache(profile.id, valid.clone()).unwrap();
+        let path = store.root.join("usage-cache.json");
+        let before = platform::read(&path).unwrap();
+        let mut invalid = valid;
+        invalid.remaining_percent = 170;
+        assert!(store.cache(profile.id, invalid.clone()).is_err());
+        assert_eq!(platform::read(&path).unwrap(), before);
+        assert_eq!(store.cache.entries[0].usage.remaining_percent, 100);
+
+        store.cache.entries[0].usage = invalid;
+        write(&path, &store.cache).unwrap();
+        let damaged = platform::read(&path).unwrap();
+        let reloaded = Store::load(store.root.clone(), store.active.clone()).unwrap();
+        assert!(reloaded.cache.entries.is_empty());
+        assert!(reloaded.warning.unwrap().contains("Usage percentages"));
+        assert_eq!(reloaded.registry.accounts.len(), 1);
+        let backup = fs::read_dir(&store.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("usage-cache.json.corrupt-")
+            })
+            .unwrap();
+        assert_eq!(platform::read(&backup).unwrap(), damaged);
+        platform::remove_tree(&root, &temp).unwrap();
+    }
+
+    #[test]
+    fn invalid_import_cache_is_rejected_before_any_destination_writes() {
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("switcher-import-validation-{}", Uuid::new_v4()));
+        let mut destination = Store::load(root.join("destination"), root.join("active")).unwrap();
+        let mut source = Store::load(root.join("source"), root.join("unused")).unwrap();
+        let current = credential("current", "test-user", None);
+        platform::atomic_write(&destination.active_file(), &current).unwrap();
+        destination.sync_current().unwrap();
+        destination.save_settings(Settings::default()).unwrap();
+        write(
+            &destination.root.join("usage-cache.json"),
+            &destination.cache,
+        )
+        .unwrap();
+        let imported = saved_account(&mut source, "imported");
+        let usage: Usage =
+            serde_json::from_value(serde_json::json!({"remainingPercent": 50})).unwrap();
+        source.cache(imported.id, usage).unwrap();
+        let preview = destination.preview(&source.root).unwrap();
+        let paths = ["accounts.json", "settings.json", "usage-cache.json"];
+        let before: Vec<_> = paths
+            .iter()
+            .map(|name| platform::read(&destination.root.join(name)).unwrap())
+            .collect();
+        source.cache.entries[0].usage.reset_credits_remaining = Some(-3);
+        let source_cache = source.root.join("usage-cache.json");
+        write(&source_cache, &source.cache).unwrap();
+        let source_before = platform::read(&source_cache).unwrap();
+        assert!(destination.preview(&source.root).is_err());
+        assert!(destination.import(&preview).is_err());
+        for (name, bytes) in paths.iter().zip(before) {
+            assert_eq!(platform::read(&destination.root.join(name)).unwrap(), bytes);
+        }
+        assert_eq!(platform::read(&destination.active_file()).unwrap(), current);
+        assert_eq!(platform::read(&source_cache).unwrap(), source_before);
+        assert!(!destination.home(imported.id).exists());
+        assert_eq!(destination.registry.accounts.len(), 1);
+        assert!(destination.cache.entries.is_empty());
         platform::remove_tree(&root, &temp).unwrap();
     }
 

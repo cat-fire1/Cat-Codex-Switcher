@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -118,6 +118,22 @@ pub struct Usage {
     pub reset_credits_remaining: Option<i64>,
     pub reset_credits: Option<Vec<Credit>>,
 }
+impl Usage {
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            (0..=100).contains(&self.remaining_percent)
+                && self
+                    .five_hour_remaining_percent
+                    .is_none_or(|value| (0..=100).contains(&value)),
+            "Usage percentages must be between 0 and 100"
+        );
+        ensure!(
+            self.reset_credits_remaining.is_none_or(|value| value >= 0),
+            "Available reset credits must not be negative"
+        );
+        Ok(())
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheEntry {
@@ -132,6 +148,18 @@ pub struct Cache {
     #[serde(default = "format")]
     pub format_version: u32,
     pub entries: Vec<CacheEntry>,
+}
+impl Cache {
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.format_version <= FORMAT,
+            "Unsupported data format version"
+        );
+        for entry in &self.entries {
+            entry.usage.validate()?;
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Debug)]
 pub struct Identity {
@@ -338,6 +366,31 @@ fn service_date(v: &Value) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn usage_validation_accepts_boundaries_and_rejects_invalid_values() {
+        let mut usage: Usage = serde_json::from_value(json!({"remainingPercent": 0})).unwrap();
+        for weekly in [0, 100] {
+            for five_hour in [None, Some(0), Some(100)] {
+                for credits in [None, Some(0), Some(i64::MAX)] {
+                    usage.remaining_percent = weekly;
+                    usage.five_hour_remaining_percent = five_hour;
+                    usage.reset_credits_remaining = credits;
+                    usage.validate().unwrap();
+                }
+            }
+        }
+        for value in [-1, 101, i32::MIN, i32::MAX] {
+            usage.remaining_percent = value;
+            assert!(usage.validate().is_err());
+            usage.remaining_percent = 50;
+            usage.five_hour_remaining_percent = Some(value);
+            assert!(usage.validate().is_err());
+            usage.five_hour_remaining_percent = None;
+        }
+        usage.reset_credits_remaining = Some(-1);
+        assert!(usage.validate().is_err());
+    }
 
     fn window(minutes: i64, used: f64, reset: f64) -> Value {
         json!({"windowDurationMins": minutes, "usedPercent": used, "resetsAt": reset})
