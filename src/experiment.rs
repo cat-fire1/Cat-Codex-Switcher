@@ -181,8 +181,13 @@ impl Experiment {
                 if self.completed.contains(&key) || e.scheduled_at.is_none_or(|at| now < at) {
                     continue;
                 }
-                let next = credit.expires_at.expect("checkpoint has expiry")
-                    - chrono::Duration::minutes([5, 1, 0][index]);
+                let Some(next) = credit
+                    .expires_at
+                    .expect("checkpoint has expiry")
+                    .checked_sub_signed(chrono::Duration::minutes([5, 1, 0][index]))
+                else {
+                    continue;
+                };
                 e.account = Some(profile.display_name.clone());
                 e.usage = usage.cloned();
                 e.error = error.clone();
@@ -213,7 +218,9 @@ impl Experiment {
     }
 }
 fn checkpoint(id: Uuid, credit: &Credit, minutes: i64, now: DateTime<Utc>) -> Option<Event> {
-    let at = credit.expires_at? - chrono::Duration::minutes(minutes);
+    let at = credit
+        .expires_at?
+        .checked_sub_signed(chrono::Duration::minutes(minutes))?;
     let mut e = Event::marker("checkpoint", now);
     e.profile_id = Some(id);
     e.credit_id = Some(credit.id.clone());
@@ -241,6 +248,74 @@ pub fn append(path: &Path, events: &[Event]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoints_skip_underflow_and_keep_representable_boundaries() {
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        for offset in [0, 1, 5, 10] {
+            let credit = Credit {
+                id: "credit".into(),
+                status: "available".into(),
+                reset_type: "codexRateLimits".into(),
+                expires_at: Some(DateTime::<Utc>::MIN_UTC + chrono::Duration::minutes(offset)),
+            };
+            for minutes in [10, 5, 1] {
+                let event = checkpoint(id, &credit, minutes, now);
+                if offset < minutes {
+                    assert!(event.is_none());
+                } else {
+                    assert_eq!(
+                        event.unwrap().scheduled_at,
+                        Some(
+                            DateTime::<Utc>::MIN_UTC + chrono::Duration::minutes(offset - minutes)
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn observing_extreme_expiry_keeps_normal_checkpoints_working() {
+        let now = Utc::now();
+        let profile = crate::model::Identity {
+            account_id: Some("workspace".into()),
+            user_id: Some("user".into()),
+            email: None,
+        }
+        .profile();
+        let mut usage = Usage {
+            remaining_percent: 50,
+            resets_at: None,
+            five_hour_remaining_percent: None,
+            five_hour_resets_at: None,
+            reset_credits_remaining: Some(1),
+            reset_credits: Some(vec![Credit {
+                id: "credit".into(),
+                status: "available".into(),
+                reset_type: "codexRateLimits".into(),
+                expires_at: Some(DateTime::<Utc>::MIN_UTC),
+            }]),
+        };
+        let mut experiment = Experiment::default();
+        assert_eq!(
+            experiment.observe(&profile, Some(&usage), None, now).len(),
+            1
+        );
+        assert!(experiment.next(&HashSet::from([profile.id])).is_none());
+        usage.reset_credits.as_mut().unwrap()[0].expires_at =
+            Some(now + chrono::Duration::minutes(10));
+        let events = experiment.observe(&profile, Some(&usage), None, now);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].checkpoint_minutes, Some(10));
+        assert_eq!(events[1].scheduled_at, Some(now));
+        assert_eq!(events[1].decision.as_deref(), Some("would_attempt"));
+        assert_eq!(
+            experiment.next(&HashSet::from([profile.id])),
+            Some(now + chrono::Duration::minutes(5))
+        );
+    }
 
     #[test]
     fn interrupted_tail_is_preserved_and_checkpoints_survive_repair() {
