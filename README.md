@@ -45,34 +45,43 @@ Credentials зберігаються локально як повні `auth.json
 
 Для власних оновлень укажіть `owner/repository` у налаштуваннях. Перевірка ручна або щогодини, якщо її ввімкнено. Порожнє джерело не створює мережевих запитів. Підходять стабільні релізи `vMAJOR.MINOR.PATCH` з asset `Cat-Codex-Switcher.exe`. Нова версія відкривається у браузері для ручної заміни після виходу. Релізи оригіналу не є оновленнями цієї програми.
 
-## Збірка та перевірки
+## Збірка та запуск
 
-Потрібні Rust stable для `x86_64-pc-windows-msvc` і Visual Studio C++ Build Tools із Windows SDK. Версії залежностей зафіксовані в `Cargo.lock`. Налаштування Cargo статично компонують CRT.
+Потрібні:
+- **Rust stable** для `x86_64-pc-windows-msvc` і Visual Studio C++ Build Tools із Windows SDK.
+- **Node.js** (v18+) та npm для збірки веб-інтерфейсу.
 
 ```powershell
 git clone https://github.com/cat-fire1/Cat-Codex-Switcher.git
 cd Cat-Codex-Switcher
-cargo fmt --check
-cargo test --locked --all-targets
-cargo clippy --locked --all-targets -- -D warnings
-cargo build --locked --release --bin Cat-Codex-Switcher
-.\target\release\Cat-Codex-Switcher.exe
+
+# 1. Встановлення залежностей веб-інтерфейсу
+npm install
+
+# 2. Тестування Rust-бэкенду
+cargo test
+
+# 3. Запуск у режимі розробки з гарячим перезавантаженням (HMR)
+npx tauri dev
+
+# 4. Складання автономного релізного EXE (без веб-сервера)
+npx tauri build --no-bundle
 ```
 
-Готовий файл після збірки: `target/release/Cat-Codex-Switcher.exe` (або відповідний шлях у `CARGO_TARGET_DIR`, якщо його задано). Для portable-пакета скопіюйте EXE в `dist/` разом із `LICENSE` і повідомленнями ліцензій залежностей. `build.rs` додає іконку та властивості Windows EXE.
+Готовий автономний файл після збірки: `target/release/Cat-Codex-Switcher.exe`. Весь інтерфейс вшитий всередину EXE, сторонні сервери чи Node.js для запуску готового файлу не потрібні.
 
 ## Структура проєкту
 
 | Шлях | Призначення |
 |---|---|
-| `src/main.rs`, `src/ui.rs`, `src/windows_style.rs` | Запуск і віконний інтерфейс |
-| `src/model.rs`, `src/store.rs` | Моделі, збереження акаунтів, імпорт і перемикання |
-| `src/rpc.rs`, `src/worker.rs` | Codex runtime та фонові операції |
-| `src/platform.rs`, `src/tray.rs` | Інтеграція з Windows і системний трей |
-| `src/i18n.rs` | Переклади інтерфейсу |
-| `src/updates.rs`, `src/experiment.rs` | Перевірка оновлень та журнал спостережень |
-| `assets/` | Логотипи й іконка застосунку |
-| `PARITY.md` | Історичний звіт про відповідність оригіналу та перевірки |
+| `src/` | Веб-інтерфейс (React, TypeScript, Tailwind CSS, Lucide Icons, Framer Motion) |
+| `src-tauri/src/lib.rs` | Tauri v2 команди (IPC), системний трей та життєвий цикл застосунку |
+| `src-tauri/src/model.rs`, `store.rs` | Моделі, безпечне збереження акаунтів, імпорт і перемикання |
+| `src-tauri/src/rpc.rs`, `worker.rs` | Codex runtime, фонові операції та оновлення лімітів |
+| `src-tauri/src/platform.rs` | Інтеграція з Windows API, DACL-безпека, автозапуск, єдиний екземпляр |
+| `src-tauri/src/updates.rs`, `experiment.rs` | Перевірка оновлень з GitHub та журнал спостережень |
+| `assets/`, `public/assets/` | Логотипи та іконки застосунку |
+| `PARITY.md` | Звіт про відповідність оригіналу та перевірки |
 
 ## Стан перевірок
 

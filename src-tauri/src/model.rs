@@ -72,7 +72,7 @@ fn short_id(value: &str) -> String {
 fn format() -> u32 {
     FORMAT
 }
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     pub format_version: u32,

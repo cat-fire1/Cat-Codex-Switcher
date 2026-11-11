@@ -7,6 +7,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -19,7 +20,10 @@ use std::{
 };
 use uuid::Uuid;
 
-#[derive(Clone)]
+pub type Notifier = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct Row {
     pub profile: Profile,
     pub title: String,
@@ -29,7 +33,8 @@ pub struct Row {
     pub error: Option<String>,
     pub subscription: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub rows: Vec<Row>,
     pub active: Option<Uuid>,
@@ -95,7 +100,7 @@ impl Worker {
     pub fn start(
         root: PathBuf,
         active: PathBuf,
-        ctx: egui::Context,
+        notifier: Notifier,
         shared: Arc<Mutex<Snapshot>>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
@@ -116,7 +121,7 @@ impl Worker {
                     refresh_failed: false,
                     pending: queued,
                     shared: shared.clone(),
-                    ctx: ctx.clone(),
+                    notifier: notifier.clone(),
                     token,
                     rt,
                 };
@@ -233,7 +238,7 @@ impl Worker {
                 if let Ok(mut latest) = shared.lock() {
                     *latest = s;
                 }
-                ctx.request_repaint();
+                (notifier)();
             }
         });
         Self {
@@ -263,7 +268,7 @@ struct Engine {
     refresh_failed: bool,
     pending: Arc<AtomicUsize>,
     shared: Arc<Mutex<Snapshot>>,
-    ctx: egui::Context,
+    notifier: Notifier,
     token: Arc<AtomicBool>,
     rt: tokio::runtime::Runtime,
 }
@@ -313,7 +318,7 @@ impl Engine {
             snapshot.refreshing &= !queued;
             *latest = snapshot;
         }
-        self.ctx.request_repaint();
+        (self.notifier)();
     }
     fn reset_experiment(&mut self, event: &str) -> Result<()> {
         if self.store.settings.reset_expiry_experiment_enabled {
@@ -646,7 +651,7 @@ mod tests {
                 refresh_failed: false,
                 pending: Arc::new(AtomicUsize::new(0)),
                 shared: Arc::new(Mutex::new(Snapshot::default())),
-                ctx: egui::Context::default(),
+                notifier: Arc::new(|| {}),
                 token: Arc::new(AtomicBool::new(false)),
                 rt: tokio::runtime::Runtime::new().unwrap(),
             };
@@ -732,7 +737,7 @@ mod tests {
             refresh_failed: false,
             pending: Arc::new(AtomicUsize::new(0)),
             shared: Arc::new(Mutex::new(Snapshot::default())),
-            ctx: egui::Context::default(),
+            notifier: Arc::new(|| {}),
             token: Arc::new(AtomicBool::new(false)),
             rt: tokio::runtime::Runtime::new().unwrap(),
         };
@@ -769,7 +774,7 @@ mod tests {
             refresh_failed: false,
             pending: Arc::new(AtomicUsize::new(0)),
             shared: Arc::new(Mutex::new(Snapshot::default())),
-            ctx: egui::Context::default(),
+            notifier: Arc::new(|| {}),
             token: Arc::new(AtomicBool::new(false)),
             rt: tokio::runtime::Runtime::new().unwrap(),
         };
@@ -834,7 +839,7 @@ mod tests {
             refresh_failed: false,
             pending: Arc::new(AtomicUsize::new(0)),
             shared: Arc::new(Mutex::new(Snapshot::default())),
-            ctx: egui::Context::default(),
+            notifier: Arc::new(|| {}),
             token: Arc::new(AtomicBool::new(false)),
             rt: tokio::runtime::Runtime::new().unwrap(),
         };
@@ -934,7 +939,7 @@ mod tests {
             refresh_failed: false,
             pending: Arc::new(AtomicUsize::new(0)),
             shared: Arc::new(Mutex::new(Snapshot::default())),
-            ctx: egui::Context::default(),
+            notifier: Arc::new(|| {}),
             token: Arc::new(AtomicBool::new(false)),
             rt: tokio::runtime::Runtime::new().unwrap(),
         };
