@@ -1,5 +1,9 @@
 import React from "react";
-import { RotateCw, Settings, FolderInput, Cat } from "lucide-react";
+import {
+  ArrowSync16Regular,
+  FolderOpen16Regular,
+  Settings16Regular,
+} from "@fluentui/react-icons";
 import { getT } from "../lib/i18n";
 
 interface HeaderProps {
@@ -20,54 +24,56 @@ export const Header: React.FC<HeaderProps> = ({
   const t = getT(language);
 
   return (
-    <header className="sticky top-0 z-30 flex items-center justify-between px-5 py-3.5 glass-panel border-b border-white/5">
-      <div className="flex items-center gap-3">
-        <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-amber-500/30 to-orange-500/20 p-[1px] shadow-lg shadow-orange-500/10 border border-white/10 overflow-hidden flex items-center justify-center bg-[#151821]">
+    <header className="sticky top-0 z-30 flex items-center justify-between px-4 py-2.5 bg-[#202020] border-b border-[rgba(255,255,255,0.06)] select-none">
+      {/* App brand */}
+      <div className="flex items-center gap-2.5">
+        <div className="w-7 h-7 rounded-md overflow-hidden bg-white/5 border border-white/10 flex items-center justify-center p-0.5 shadow-sm">
           <img
             src="/assets/account-switcher-logo.png"
             alt="Cat Codex Switcher"
-            className="w-full h-full object-cover rounded-[11px]"
+            className="w-full h-full object-contain"
             onError={(e) => {
-              // Fallback if image path has issue
               (e.target as HTMLElement).style.display = "none";
             }}
           />
         </div>
-        <div>
-          <h1 className="text-sm font-bold tracking-tight text-white flex items-center gap-2">
+        <div className="flex items-baseline gap-2">
+          <span className="text-[13px] font-semibold tracking-tight text-white font-sans">
             {t.appTitle}
-            <span className="text-[10px] uppercase font-semibold tracking-wider px-1.5 py-0.5 rounded-full bg-orange-500/10 text-orange-400 border border-orange-500/20">
-              v0.2
-            </span>
-          </h1>
-          <p className="text-[11px] text-zinc-400">Codex Account Manager</p>
+          </span>
+          <span className="text-[10px] text-zinc-400 font-normal">
+            Codex Manager
+          </span>
         </div>
       </div>
 
-      <div className="flex items-center gap-1.5">
+      {/* Fluent Command Buttons */}
+      <div className="flex items-center gap-1">
         <button
           onClick={onRefresh}
           disabled={refreshing}
           title={t.refresh}
-          className="p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-white/5 transition active:scale-95 disabled:opacity-50"
+          className="w-8 h-8 flex items-center justify-center rounded hover:bg-white/5 active:bg-white/10 text-zinc-300 hover:text-white transition-colors disabled:opacity-50"
         >
-          <RotateCw className={`w-4 h-4 ${refreshing ? "animate-spin text-orange-400" : ""}`} />
+          <ArrowSync16Regular
+            className={`w-4 h-4 ${refreshing ? "animate-spin text-[#ff7a45]" : ""}`}
+          />
         </button>
 
         <button
           onClick={onOpenImport}
           title={t.importData}
-          className="p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-white/5 transition active:scale-95"
+          className="w-8 h-8 flex items-center justify-center rounded hover:bg-white/5 active:bg-white/10 text-zinc-300 hover:text-white transition-colors"
         >
-          <FolderInput className="w-4 h-4" />
+          <FolderOpen16Regular className="w-4 h-4" />
         </button>
 
         <button
           onClick={onOpenSettings}
           title={t.settings}
-          className="p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-white/5 transition active:scale-95"
+          className="w-8 h-8 flex items-center justify-center rounded hover:bg-white/5 active:bg-white/10 text-zinc-300 hover:text-white transition-colors"
         >
-          <Settings className="w-4 h-4" />
+          <Settings16Regular className="w-4 h-4" />
         </button>
       </div>
     </header>

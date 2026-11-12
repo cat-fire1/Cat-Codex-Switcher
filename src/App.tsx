@@ -8,7 +8,12 @@ import { Banner } from "./components/Banner";
 import { api } from "./lib/api";
 import { getT } from "./lib/i18n";
 import { Snapshot, Settings } from "./types";
-import { Plus, UserCheck, Loader2 } from "lucide-react";
+import {
+  PersonAdd16Regular,
+  PersonAvailable16Regular,
+  ArrowSync16Regular,
+  Person16Regular,
+} from "@fluentui/react-icons";
 
 export const App: React.FC = () => {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
@@ -103,8 +108,8 @@ export const App: React.FC = () => {
 
   if (loading) {
     return (
-      <div className="flex h-screen w-screen items-center justify-center bg-[#0b0d13]">
-        <Loader2 className="w-8 h-8 text-orange-500 animate-spin" />
+      <div className="flex h-screen w-screen items-center justify-center bg-[#202020]">
+        <ArrowSync16Regular className="w-6 h-6 text-[#ff7a45] animate-spin" />
       </div>
     );
   }
@@ -120,7 +125,7 @@ export const App: React.FC = () => {
   });
 
   return (
-    <div className="flex flex-col h-screen w-screen bg-[#0b0d13] text-zinc-100 select-none overflow-hidden">
+    <div className="flex flex-col h-screen w-screen bg-[#202020] text-white select-none overflow-hidden font-sans">
       {/* Top Header */}
       <Header
         language={language}
@@ -133,50 +138,49 @@ export const App: React.FC = () => {
       {/* Error or Warning Banner */}
       <Banner message={snapshot?.error || null} onDismiss={handleDismissError} />
 
-      {/* Main Content Area */}
-      <main className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
-        {/* Action Controls Bar */}
-        <div className="flex items-center justify-between gap-3 bg-[#13161f] p-3 rounded-2xl border border-white/5 shadow-sm">
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleAddAccount}
-              disabled={Boolean(snapshot?.busy)}
-              className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-gradient-to-r from-orange-500 to-amber-600 hover:from-orange-600 hover:to-amber-700 text-white shadow-lg shadow-orange-500/20 transition active:scale-95 disabled:opacity-50"
-            >
-              <Plus className="w-4 h-4" />
-              {t.addAccount}
-            </button>
+      {/* Action CommandBar */}
+      <div className="flex items-center justify-between px-4 py-2.5 bg-[#252525] border-b border-[rgba(255,255,255,0.06)]">
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handleAddAccount}
+            disabled={Boolean(snapshot?.busy)}
+            className="fluent-btn-accent px-3 py-1.5 flex items-center gap-1.5 disabled:opacity-50"
+          >
+            <PersonAdd16Regular className="w-4 h-4" />
+            <span>{t.addAccount}</span>
+          </button>
 
-            <button
-              onClick={handleRegisterCurrent}
-              disabled={Boolean(snapshot?.busy)}
-              className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium bg-white/5 hover:bg-white/10 text-zinc-200 border border-white/10 transition active:scale-95 disabled:opacity-50"
-            >
-              <UserCheck className="w-4 h-4 text-zinc-400" />
-              {t.registerCurrent}
-            </button>
-          </div>
-
-          {snapshot?.adding && (
-            <div className="flex items-center gap-2 text-xs text-orange-400 font-medium animate-pulse">
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              Очікування входу в браузері...
-            </div>
-          )}
+          <button
+            onClick={handleRegisterCurrent}
+            disabled={Boolean(snapshot?.busy)}
+            className="fluent-btn-standard px-3 py-1.5 flex items-center gap-1.5 disabled:opacity-50"
+          >
+            <PersonAvailable16Regular className="w-4 h-4 text-zinc-300" />
+            <span>{t.registerCurrent}</span>
+          </button>
         </div>
 
-        {/* Accounts List */}
+        {snapshot?.adding && (
+          <div className="flex items-center gap-1.5 text-xs text-[#ff7a45] font-medium animate-pulse">
+            <ArrowSync16Regular className="w-3.5 h-3.5 animate-spin" />
+            <span>Очікування входу в браузері...</span>
+          </div>
+        )}
+      </div>
+
+      {/* Main Content Area */}
+      <main className="flex-1 overflow-y-auto px-4 py-3 space-y-2.5">
         {sortedRows.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-16 text-center px-4">
-            <div className="w-16 h-16 rounded-3xl bg-zinc-900 border border-white/5 flex items-center justify-center text-zinc-500 mb-4 shadow-inner">
-              <UserCheck className="w-8 h-8" />
+            <div className="w-12 h-12 rounded-full bg-white/5 border border-white/10 flex items-center justify-center text-zinc-400 mb-3 shadow-inner">
+              <Person16Regular className="w-6 h-6" />
             </div>
             <p className="text-xs text-zinc-400 max-w-xs leading-relaxed">
               {t.noAccounts}
             </p>
           </div>
         ) : (
-          <div className="space-y-3 pb-4">
+          <div className="space-y-2.5 pb-2">
             {sortedRows.map((row) => (
               <AccountCard
                 key={row.profile.id}

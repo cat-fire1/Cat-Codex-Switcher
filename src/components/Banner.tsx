@@ -1,5 +1,5 @@
 import React from "react";
-import { AlertTriangle, X } from "lucide-react";
+import { Warning16Regular, Dismiss16Regular } from "@fluentui/react-icons";
 
 interface BannerProps {
   message: string | null;
@@ -10,10 +10,10 @@ export const Banner: React.FC<BannerProps> = ({ message, onDismiss }) => {
   if (!message) return null;
 
   return (
-    <div className="mx-5 my-3 p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-300 flex items-start justify-between gap-3 animate-in fade-in slide-in-from-top-2 duration-200">
-      <div className="flex items-start gap-2.5">
-        <AlertTriangle className="w-4 h-4 text-rose-400 mt-0.5 flex-shrink-0" />
-        <div className="text-xs space-y-1">
+    <div className="mx-4 my-2.5 p-2.5 rounded bg-red-500/10 border border-red-500/25 text-red-200 flex items-start justify-between gap-2.5 text-xs">
+      <div className="flex items-start gap-2">
+        <Warning16Regular className="w-4 h-4 text-red-400 mt-0.5 flex-shrink-0" />
+        <div className="space-y-0.5">
           {message.split("\n").map((line, idx) => (
             <p key={idx} className="leading-snug">
               {line}
@@ -23,9 +23,9 @@ export const Banner: React.FC<BannerProps> = ({ message, onDismiss }) => {
       </div>
       <button
         onClick={onDismiss}
-        className="p-1 rounded-lg text-rose-400/80 hover:text-rose-200 hover:bg-rose-500/20 transition flex-shrink-0"
+        className="p-1 rounded text-zinc-400 hover:text-white hover:bg-white/10 transition-colors flex-shrink-0"
       >
-        <X className="w-3.5 h-3.5" />
+        <Dismiss16Regular className="w-3.5 h-3.5" />
       </button>
     </div>
   );

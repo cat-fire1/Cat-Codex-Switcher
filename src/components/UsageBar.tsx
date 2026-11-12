@@ -1,5 +1,5 @@
 import React from "react";
-import { Clock } from "lucide-react";
+import { Timer16Regular } from "@fluentui/react-icons";
 
 interface UsageBarProps {
   label: string;
@@ -39,36 +39,41 @@ export const UsageBar: React.FC<UsageBarProps> = ({
   };
 
   const getBarColor = (val: number) => {
-    if (val > 50) return "from-emerald-500 to-teal-400";
-    if (val > 20) return "from-amber-500 to-yellow-400";
-    return "from-rose-500 to-red-400";
+    if (val > 50) return "bg-[#6ccb5f]";
+    if (val > 20) return "bg-[#f59e0b]";
+    return "bg-[#f87171]";
   };
 
   const getTextColor = (val: number) => {
-    if (val > 50) return "text-emerald-400";
+    if (val > 50) return "text-[#6ccb5f]";
     if (val > 20) return "text-amber-400";
-    return "text-rose-400";
+    return "text-red-400";
   };
 
   return (
-    <div className="space-y-1.5">
-      <div className="flex justify-between items-center text-xs">
-        <span className="text-zinc-400 font-medium">{label}</span>
-        <span className={`font-semibold ${getTextColor(clamped)}`}>{clamped}%</span>
+    <div className="py-1">
+      {/* Label and Countdown info */}
+      <div className="flex items-center justify-between text-[11px] mb-1.5">
+        <span className="text-zinc-300 font-medium">{label}</span>
+        <div className="flex items-center gap-1.5">
+          <span className="text-[10px] text-zinc-400 flex items-center gap-1 font-mono">
+            <Timer16Regular className="w-3 h-3 text-zinc-500" />
+            {formatCountdown(resetsAt)}
+          </span>
+          <span className={`font-semibold text-xs min-w-[32px] text-right ${getTextColor(clamped)}`}>
+            {clamped}%
+          </span>
+        </div>
       </div>
 
-      <div className="h-2 w-full bg-zinc-800/80 rounded-full overflow-hidden p-[1px] border border-white/5">
+      {/* WinUI 3 styled ProgressBar */}
+      <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden">
         <div
-          className={`h-full rounded-full bg-gradient-to-r ${getBarColor(
+          className={`h-full rounded-full transition-all duration-300 ease-out ${getBarColor(
             clamped
-          )} transition-all duration-500 ease-out`}
+          )}`}
           style={{ width: `${clamped}%` }}
         />
-      </div>
-
-      <div className="flex items-center gap-1 text-[11px] text-zinc-500 font-mono">
-        <Clock className="w-3 h-3 text-zinc-500" />
-        <span>{formatCountdown(resetsAt)}</span>
       </div>
     </div>
   );
