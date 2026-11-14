@@ -20,7 +20,10 @@ interface SettingsModalProps {
   onOpenUrl: (url: string) => void;
 }
 
-export const SettingsModal: React.FC<SettingsModalProps> = ({
+export const SettingsModal: React.FC<SettingsModalProps> = (props) =>
+  props.isOpen ? <SettingsForm {...props} /> : null;
+
+const SettingsForm: React.FC<SettingsModalProps> = ({
   isOpen,
   settings: initialSettings,
   updateStatus,

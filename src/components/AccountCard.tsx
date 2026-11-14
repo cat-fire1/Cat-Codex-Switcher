@@ -14,6 +14,7 @@ interface AccountCardProps {
   isActive: boolean;
   showFiveHour: boolean;
   language: string;
+  busy?: boolean;
   onSwitch: (id: string) => void;
   onRemove: (id: string) => void;
 }
@@ -23,6 +24,7 @@ export const AccountCard: React.FC<AccountCardProps> = ({
   isActive,
   showFiveHour,
   language,
+  busy = false,
   onSwitch,
   onRemove,
 }) => {
@@ -95,6 +97,7 @@ export const AccountCard: React.FC<AccountCardProps> = ({
           ) : (
             <div className="flex items-center gap-1">
               <button
+                disabled={busy}
                 onClick={() => onSwitch(profile.id)}
                 className="fluent-btn-standard px-2.5 py-1 flex items-center gap-1"
               >
@@ -102,6 +105,7 @@ export const AccountCard: React.FC<AccountCardProps> = ({
                 <span>{t.switchBtn}</span>
               </button>
               <button
+                disabled={busy}
                 onClick={() => onRemove(profile.id)}
                 className="w-7 h-7 flex items-center justify-center rounded text-zinc-400 hover:text-red-400 hover:bg-white/5 active:bg-white/10 transition-colors"
                 title={t.removeBtn}

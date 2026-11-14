@@ -9,6 +9,7 @@ import { getT } from "../lib/i18n";
 interface HeaderProps {
   language: string;
   refreshing: boolean;
+  busy?: boolean;
   onRefresh: () => void;
   onOpenSettings: () => void;
   onOpenImport: () => void;
@@ -17,6 +18,7 @@ interface HeaderProps {
 export const Header: React.FC<HeaderProps> = ({
   language,
   refreshing,
+  busy = false,
   onRefresh,
   onOpenSettings,
   onOpenImport,
@@ -51,7 +53,7 @@ export const Header: React.FC<HeaderProps> = ({
       <div className="flex items-center gap-1">
         <button
           onClick={onRefresh}
-          disabled={refreshing}
+          disabled={busy || refreshing}
           title={t.refresh}
           className="w-8 h-8 flex items-center justify-center rounded hover:bg-white/5 active:bg-white/10 text-zinc-300 hover:text-white transition-colors disabled:opacity-50"
         >
@@ -62,6 +64,7 @@ export const Header: React.FC<HeaderProps> = ({
 
         <button
           onClick={onOpenImport}
+          disabled={busy}
           title={t.importData}
           className="w-8 h-8 flex items-center justify-center rounded hover:bg-white/5 active:bg-white/10 text-zinc-300 hover:text-white transition-colors"
         >
@@ -70,6 +73,7 @@ export const Header: React.FC<HeaderProps> = ({
 
         <button
           onClick={onOpenSettings}
+          disabled={busy}
           title={t.settings}
           className="w-8 h-8 flex items-center justify-center rounded hover:bg-white/5 active:bg-white/10 text-zinc-300 hover:text-white transition-colors"
         >

@@ -110,6 +110,11 @@ export const api = {
     await invoke("add_account");
   },
 
+  async cancelLogin(): Promise<void> {
+    if (!isTauri()) return;
+    await invoke("cancel_login");
+  },
+
   async registerCurrent(): Promise<void> {
     if (!isTauri()) {
       alert("Register current login is only available in Tauri desktop app.");

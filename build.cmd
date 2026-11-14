@@ -25,7 +25,7 @@ if %ERRORLEVEL% neq 0 (
 :: 3. Install npm dependencies if missing
 if not exist "node_modules" (
     echo [*] Installing npm frontend dependencies...
-    call npm.cmd install
+    call npm.cmd ci
     if %ERRORLEVEL% neq 0 (
         echo [ERROR] npm install failed!
         pause
@@ -59,17 +59,9 @@ if exist "%TARGET_EXE%" (
     exit /b 1
 )
 
-:: 6. Clean up heavy caches and node_modules
-echo.
-echo [*] Cleaning up heavy build caches and node_modules...
-if exist "src-tauri\target" rmdir /s /q "src-tauri\target"
-if exist "target" rmdir /s /q "target"
-if exist "node_modules" rmdir /s /q "node_modules"
-if exist "dist" rmdir /s /q "dist"
-
 echo.
 echo ========================================================
-echo     Build and cleanup completed successfully!
+echo     Build completed. Caches kept for the next build.
 echo ========================================================
 echo.
 pause

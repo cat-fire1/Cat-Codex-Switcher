@@ -14,6 +14,7 @@ interface ImportModalProps {
   isOpen: boolean;
   language: string;
   preview: ImportPreview | null;
+  busy?: boolean;
   onClose: () => void;
   onSelectFolder: () => Promise<string | null>;
   onPreview: (path: string) => void;
@@ -23,15 +24,15 @@ interface ImportModalProps {
 export const ImportModal: React.FC<ImportModalProps> = ({
   isOpen,
   language,
-  preview,
+  preview: suppliedPreview,
+  busy = false,
   onClose,
   onSelectFolder,
   onPreview,
   onConfirm,
 }) => {
-  const [path, setPath] = useState(
-    "C:\\Users\\cat\\AppData\\Local\\Codex Account Switcher"
-  );
+  const [path, setPath] = useState("");
+  const preview = suppliedPreview?.source === path.trim() ? suppliedPreview : null;
   const t = getT(language);
 
   if (!isOpen) return null;
@@ -87,6 +88,7 @@ export const ImportModal: React.FC<ImportModalProps> = ({
             <div className="flex gap-2">
               <input
                 type="text"
+                disabled={busy}
                 value={path}
                 onChange={(e) => setPath(e.target.value)}
                 className="flex-1 px-2.5 py-1.5 rounded bg-black/30 border border-white/10 text-white text-xs font-mono focus:outline-none focus:border-[#ff7a45]"
@@ -94,6 +96,7 @@ export const ImportModal: React.FC<ImportModalProps> = ({
               <button
                 type="button"
                 onClick={handleBrowse}
+                disabled={busy}
                 className="fluent-btn-standard px-2.5 py-1.5"
               >
                 {t.browse}
@@ -105,6 +108,7 @@ export const ImportModal: React.FC<ImportModalProps> = ({
             <button
               type="button"
               onClick={handlePreview}
+              disabled={busy || !path.trim()}
               className="fluent-btn-standard px-2.5 py-1.5 flex items-center gap-1.5"
             >
               <Eye16Regular className="w-3.5 h-3.5" />
@@ -154,7 +158,7 @@ export const ImportModal: React.FC<ImportModalProps> = ({
             {t.cancel}
           </button>
           <button
-            disabled={!preview || preview.titles.length === 0}
+            disabled={busy || !preview || preview.titles.length === 0}
             onClick={handleConfirm}
             className="fluent-btn-accent px-4 py-1 disabled:opacity-40 disabled:cursor-not-allowed"
           >

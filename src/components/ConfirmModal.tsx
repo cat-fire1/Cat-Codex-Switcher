@@ -11,6 +11,7 @@ interface ConfirmModalProps {
   type: "switch" | "remove";
   accountName?: string;
   language: string;
+  busy?: boolean;
   onClose: () => void;
   onConfirm: () => void;
 }
@@ -20,6 +21,7 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
   type,
   accountName = "",
   language,
+  busy = false,
   onClose,
   onConfirm,
 }) => {
@@ -69,6 +71,7 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
             {t.cancel}
           </button>
           <button
+            disabled={busy}
             onClick={() => {
               onConfirm();
               onClose();

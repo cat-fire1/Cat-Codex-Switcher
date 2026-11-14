@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Header } from "./components/Header";
 import { AccountCard } from "./components/AccountCard";
 import { SettingsModal } from "./components/SettingsModal";
@@ -18,6 +18,19 @@ import {
 export const App: React.FC = () => {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [loading, setLoading] = useState(true);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const actionPending = useRef(false);
+
+  const runAction = async <T,>(action: () => Promise<T>): Promise<T | undefined> => {
+    if (actionPending.current) return;
+    actionPending.current = true;
+    setSubmitting(true);
+    setActionError(null);
+    try { return await action(); }
+    catch (error) { setActionError(String(error)); }
+    finally { actionPending.current = false; setSubmitting(false); }
+  };
 
   // Modals state
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -39,7 +52,7 @@ export const App: React.FC = () => {
       const data = await api.getSnapshot();
       setSnapshot(data);
     } catch (e) {
-      console.error("Failed to load snapshot", e);
+      setActionError(String(e));
     } finally {
       setLoading(false);
     }
@@ -55,19 +68,31 @@ export const App: React.FC = () => {
     };
   }, []);
 
+  useEffect(() => {
+    if (!snapshot?.adding) return;
+    const cancel = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        void runAction(() => api.cancelLogin());
+      }
+    };
+    window.addEventListener("keydown", cancel);
+    return () => window.removeEventListener("keydown", cancel);
+  }, [snapshot?.adding]);
+
   const language = snapshot?.settings.language || "uk";
   const t = getT(language);
 
   const handleRefresh = async () => {
-    await api.refresh();
+    await runAction(() => api.refresh());
   };
 
   const handleAddAccount = async () => {
-    await api.addAccount();
+    await runAction(() => api.addAccount());
   };
 
   const handleRegisterCurrent = async () => {
-    await api.registerCurrent();
+    await runAction(() => api.registerCurrent());
   };
 
   const handleSwitchRequest = (id: string) => {
@@ -92,18 +117,19 @@ export const App: React.FC = () => {
 
   const handleConfirmAction = async () => {
     if (confirmDialog.type === "switch") {
-      await api.switchAccount(confirmDialog.accountId);
+      await runAction(() => api.switchAccount(confirmDialog.accountId));
     } else {
-      await api.removeAccount(confirmDialog.accountId);
+      await runAction(() => api.removeAccount(confirmDialog.accountId));
     }
   };
 
   const handleSaveSettings = async (settings: Settings) => {
-    await api.saveSettings(settings);
+    await runAction(() => api.saveSettings(settings));
   };
 
   const handleDismissError = async () => {
-    await api.dismissError();
+    setActionError(null);
+    await runAction(() => api.dismissError());
   };
 
   if (loading) {
@@ -116,6 +142,7 @@ export const App: React.FC = () => {
 
   const rows = snapshot?.rows || [];
   const activeId = snapshot?.active;
+  const busy = submitting || Boolean(snapshot?.busy);
 
   // Sort rows: active account first, then by title
   const sortedRows = [...rows].sort((a, b) => {
@@ -130,20 +157,21 @@ export const App: React.FC = () => {
       <Header
         language={language}
         refreshing={Boolean(snapshot?.refreshing)}
+        busy={busy}
         onRefresh={handleRefresh}
         onOpenSettings={() => setIsSettingsOpen(true)}
         onOpenImport={() => setIsImportOpen(true)}
       />
 
       {/* Error or Warning Banner */}
-      <Banner message={snapshot?.error || null} onDismiss={handleDismissError} />
+      <Banner message={actionError || snapshot?.error || null} onDismiss={handleDismissError} />
 
       {/* Action CommandBar */}
       <div className="flex items-center justify-between px-4 py-2.5 bg-[#252525] border-b border-[rgba(255,255,255,0.06)]">
         <div className="flex items-center gap-2">
           <button
             onClick={handleAddAccount}
-            disabled={Boolean(snapshot?.busy)}
+            disabled={busy}
             className="fluent-btn-accent px-3 py-1.5 flex items-center gap-1.5 disabled:opacity-50"
           >
             <PersonAdd16Regular className="w-4 h-4" />
@@ -152,7 +180,7 @@ export const App: React.FC = () => {
 
           <button
             onClick={handleRegisterCurrent}
-            disabled={Boolean(snapshot?.busy)}
+            disabled={busy}
             className="fluent-btn-standard px-3 py-1.5 flex items-center gap-1.5 disabled:opacity-50"
           >
             <PersonAvailable16Regular className="w-4 h-4 text-zinc-300" />
@@ -163,7 +191,9 @@ export const App: React.FC = () => {
         {snapshot?.adding && (
           <div className="flex items-center gap-1.5 text-xs text-[#ff7a45] font-medium animate-pulse">
             <ArrowSync16Regular className="w-3.5 h-3.5 animate-spin" />
-            <span>Очікування входу в браузері...</span>
+            <span>{t.waitingForLogin}</span>
+            <button className="fluent-btn-standard px-2 py-1" disabled={submitting}
+              onClick={() => void runAction(() => api.cancelLogin())}>{t.cancel}</button>
           </div>
         )}
       </div>
@@ -188,6 +218,7 @@ export const App: React.FC = () => {
                 isActive={row.profile.id === activeId}
                 showFiveHour={Boolean(snapshot?.settings.showsFiveHourUsage)}
                 language={language}
+                busy={busy}
                 onSwitch={handleSwitchRequest}
                 onRemove={handleRemoveRequest}
               />
@@ -205,8 +236,8 @@ export const App: React.FC = () => {
           updateUrl={snapshot.updateUrl}
           onClose={() => setIsSettingsOpen(false)}
           onSave={handleSaveSettings}
-          onCheckUpdates={() => api.checkUpdates()}
-          onOpenUrl={(url) => api.openUrl(url)}
+          onCheckUpdates={() => runAction(() => api.checkUpdates())}
+          onOpenUrl={(url) => runAction(() => api.openUrl(url))}
         />
       )}
 
@@ -215,10 +246,11 @@ export const App: React.FC = () => {
         isOpen={isImportOpen}
         language={language}
         preview={snapshot?.preview || null}
+        busy={busy}
         onClose={() => setIsImportOpen(false)}
-        onSelectFolder={() => api.selectFolder()}
-        onPreview={(p) => api.previewImport(p)}
-        onConfirm={(p) => api.confirmImport(p)}
+        onSelectFolder={async () => (await runAction(() => api.selectFolder())) ?? null}
+        onPreview={(p) => runAction(() => api.previewImport(p))}
+        onConfirm={(p) => runAction(() => api.confirmImport(p))}
       />
 
       {/* Confirm Modal */}
@@ -227,6 +259,7 @@ export const App: React.FC = () => {
         type={confirmDialog.type}
         accountName={confirmDialog.accountName}
         language={language}
+        busy={busy}
         onClose={() =>
           setConfirmDialog((prev) => ({ ...prev, isOpen: false }))
         }

@@ -1,5 +1,25 @@
 use anyhow::{Result, ensure};
 use serde_json::Value;
+pub fn validate_release_url(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url)?;
+    let parts: Vec<_> = parsed.path().split('/').filter(|p| !p.is_empty()).collect();
+    ensure!(
+        parsed.scheme() == "https"
+            && parsed.host_str() == Some("github.com")
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.port().is_none()
+            && parsed.query().is_none()
+            && parsed.fragment().is_none()
+            && parts.len() == 5
+            && parts[2] == "releases"
+            && parts[3] == "tag"
+            && version(parts[4]).is_some(),
+        "Unsupported release URL"
+    );
+    repository(&format!("{}/{}", parts[0], parts[1]))?;
+    Ok(())
+}
 pub fn repository(value: &str) -> Result<Option<String>> {
     let value = value.trim();
     if value.is_empty() {
@@ -99,6 +119,24 @@ pub async fn check(repo: &str) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_urls_reject_shell_input_and_other_destinations() {
+        assert!(validate_release_url("https://github.com/owner/repo/releases/tag/v1.2.3").is_ok());
+        for url in [
+            "https://example.com/owner/repo/releases/tag/v1.2.3",
+            "http://github.com/owner/repo/releases/tag/v1.2.3",
+            "file:///C:/Windows/System32/cmd.exe",
+            "cmd /c calc",
+            "https://github.com & calc",
+            "https://user@github.com/owner/repo/releases/tag/v1.2.3",
+            "https://github.com/owner/repo/releases/tag/v1.2.3?redirect=other",
+            "https://github.com/owner/repo/releases/tag/v1.2.3#fragment",
+            "https://github.com/owner/repo/releases/tag/latest",
+        ] {
+            assert!(validate_release_url(url).is_err(), "{url}");
+        }
+    }
 
     #[test]
     fn release_tags_stay_strict_but_package_versions_allow_suffixes() {
