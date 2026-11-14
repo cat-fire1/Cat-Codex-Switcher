@@ -95,7 +95,3 @@ npx tauri build --no-bundle
 ## Ліцензія
 
 MIT. Оригінальний Codex Account Switcher © 2026 liuzhao1225. Повідомлення збережено в `LICENSE`; бібліотечні повідомлення для готового пакета збережені в dist/THIRD-PARTY-NOTICES.txt.
-
-## Перевірка продуктивності
-
-Відтворювані заміри до/після та межі перевірки описані у [BENCHMARK.md](BENCHMARK.md).
