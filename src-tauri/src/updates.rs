@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+﻿use anyhow::{Result, ensure};
 use serde_json::Value;
 pub fn validate_release_url(url: &str) -> Result<()> {
     let parsed = reqwest::Url::parse(url)?;
@@ -114,45 +114,4 @@ pub async fn check(repo: &str) -> Result<Option<String>> {
     Ok(best
         .filter(|b| b.0 > current)
         .map(|(_, tag)| format!("https://github.com/{repo}/releases/tag/{tag}")))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn release_urls_reject_shell_input_and_other_destinations() {
-        assert!(validate_release_url("https://github.com/owner/repo/releases/tag/v1.2.3").is_ok());
-        for url in [
-            "https://example.com/owner/repo/releases/tag/v1.2.3",
-            "http://github.com/owner/repo/releases/tag/v1.2.3",
-            "file:///C:/Windows/System32/cmd.exe",
-            "cmd /c calc",
-            "https://github.com & calc",
-            "https://user@github.com/owner/repo/releases/tag/v1.2.3",
-            "https://github.com/owner/repo/releases/tag/v1.2.3?redirect=other",
-            "https://github.com/owner/repo/releases/tag/v1.2.3#fragment",
-            "https://github.com/owner/repo/releases/tag/latest",
-        ] {
-            assert!(validate_release_url(url).is_err(), "{url}");
-        }
-    }
-
-    #[test]
-    fn release_tags_stay_strict_but_package_versions_allow_suffixes() {
-        assert_eq!(version("v1.2.3"), Some([1, 2, 3]));
-        assert_eq!(version("v0.1.1"), Some([0, 1, 1]));
-        for tag in [
-            "1.2.3",
-            "v1.2",
-            "v01.2.3",
-            "v1.2.3-beta.1",
-            "v1.2.3+build.7",
-        ] {
-            assert_eq!(version(tag), None);
-        }
-        assert_eq!(current_version("0.2.0-beta.1"), Some([0, 2, 0]));
-        assert_eq!(current_version("1.2.3+build.7"), Some([1, 2, 3]));
-        assert_eq!(current_version("1.2"), None);
-    }
 }

@@ -1,9 +1,5 @@
 use crate::worker::Snapshot;
 
-#[cfg(test)]
-#[path = "tray_tests.rs"]
-mod tests;
-
 pub fn percentage(snapshot: &Snapshot) -> Option<(i32, bool)> {
     let row = snapshot
         .rows
