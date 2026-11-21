@@ -1,3 +1,0 @@
-# Ports and Adapters for Account Switch Transaction
-
-Replace the shallow 7-method `Handoff` trait with a deep `AccountSwitcher` module residing in `src-tauri/src/switch.rs`. Account switching is the critical transactional invariant of the application: it coordinates external Windows Desktop processes, credential file staging, and live RPC token verification. Isolating Desktop lifecycle and token verification behind `DesktopController` and `CredentialVerifier` adapters localizes rollback safety inside the transaction engine and enables exhaustive failure testing in memory without touching OS processes.
