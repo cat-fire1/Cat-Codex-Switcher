@@ -7,6 +7,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -19,7 +20,10 @@ use std::{
 };
 use uuid::Uuid;
 
-#[derive(Clone)]
+pub type Notifier = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct Row {
     pub profile: Profile,
     pub title: String,
@@ -29,7 +33,8 @@ pub struct Row {
     pub error: Option<String>,
     pub subscription: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub rows: Vec<Row>,
     pub active: Option<Uuid>,
@@ -77,10 +82,13 @@ pub enum Command {
     Shutdown,
 }
 pub struct Worker {
-    pub commands: mpsc::Sender<Command>,
+    commands: mpsc::Sender<Command>,
     pub cancel: Arc<AtomicBool>,
     pub pending: Arc<AtomicUsize>,
-    pub join: Option<std::thread::JoinHandle<()>>,
+    join: Mutex<Option<std::thread::JoinHandle<()>>>,
+    shared: Arc<Mutex<Snapshot>>,
+    gate: Arc<Mutex<()>>,
+    stopping: Arc<AtomicBool>,
 }
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(text) = payload.downcast_ref::<&str>() {
@@ -95,7 +103,7 @@ impl Worker {
     pub fn start(
         root: PathBuf,
         active: PathBuf,
-        ctx: egui::Context,
+        notifier: Notifier,
         shared: Arc<Mutex<Snapshot>>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
@@ -103,6 +111,11 @@ impl Worker {
         let pending = Arc::new(AtomicUsize::new(0));
         let queued = pending.clone();
         let token = cancel.clone();
+        let latest = shared.clone();
+        let gate = Arc::new(Mutex::new(()));
+        let worker_gate = gate.clone();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = stopping.clone();
         let join = std::thread::spawn(move || {
             let run = || -> Result<()> {
                 let rt = tokio::runtime::Runtime::new()?;
@@ -116,9 +129,10 @@ impl Worker {
                     refresh_failed: false,
                     pending: queued,
                     shared: shared.clone(),
-                    ctx: ctx.clone(),
+                    notifier: notifier.clone(),
                     token,
                     rt,
+                    subscriptions: None,
                 };
                 if let Err(e) = engine.reset_experiment("resumed") {
                     engine.state.error = Some(format!("{e:#}"));
@@ -154,7 +168,10 @@ impl Worker {
                     match rx.recv_timeout(Duration::from_millis(200)) {
                         Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Ok(command) => {
-                            engine.pending.fetch_sub(1, Ordering::SeqCst);
+                            let dispatch = worker_gate.lock().unwrap();
+                            if worker_stopping.load(Ordering::SeqCst) {
+                                break;
+                            }
                             engine.token.store(false, Ordering::SeqCst);
                             engine.state.busy = true;
                             if !matches!(command, Command::Dismiss) {
@@ -162,6 +179,8 @@ impl Worker {
                                 engine.refresh_failed = false;
                             }
                             engine.publish();
+                            engine.pending.fetch_sub(1, Ordering::SeqCst);
+                            drop(dispatch);
                             let result = engine.command(command);
                             if let Err(e) = result
                                 && e.to_string() != "Operation cancelled"
@@ -191,10 +210,15 @@ impl Worker {
                             let refresh_due = Instant::now() >= next_refresh || checkpoint;
                             let update_due = Instant::now() >= next_update;
                             if refresh_due || update_due {
+                                let dispatch = worker_gate.lock().unwrap();
+                                if worker_stopping.load(Ordering::SeqCst) {
+                                    break;
+                                }
                                 engine.state.busy = true;
+                                engine.token.store(false, Ordering::SeqCst);
                                 engine.publish();
+                                drop(dispatch);
                                 if refresh_due {
-                                    engine.token.store(false, Ordering::SeqCst);
                                     engine.refresh();
                                     next_refresh = Instant::now() + Duration::from_secs(300);
                                 }
@@ -233,17 +257,32 @@ impl Worker {
                 if let Ok(mut latest) = shared.lock() {
                     *latest = s;
                 }
-                ctx.request_repaint();
+                (notifier)();
             }
         });
         Self {
             commands: tx,
             cancel,
             pending,
-            join: Some(join),
+            join: Mutex::new(Some(join)),
+            shared: latest,
+            gate,
+            stopping,
         }
     }
     pub fn send(&self, command: Command) -> Result<()> {
+        let _dispatch = self.gate.lock().unwrap();
+        ensure!(
+            !self.stopping.load(Ordering::SeqCst),
+            "Application is shutting down"
+        );
+        if !matches!(command, Command::Dismiss) {
+            let snapshot = self.shared.lock().unwrap();
+            ensure!(
+                self.pending.load(Ordering::SeqCst) == 0 && (!snapshot.busy || snapshot.refreshing),
+                "Another operation is already running"
+            );
+        }
         if !matches!(command, Command::Dismiss) {
             self.cancel.store(true, Ordering::SeqCst);
         }
@@ -253,7 +292,46 @@ impl Worker {
             anyhow::anyhow!("Background worker stopped. Restart the application.")
         })
     }
+
+    pub fn cancel_login(&self) -> Result<()> {
+        let _dispatch = self.gate.lock().unwrap();
+        ensure!(
+            self.shared.lock().unwrap().adding,
+            "No browser login is running"
+        );
+        self.cancel.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn begin_shutdown(&self) -> bool {
+        let _dispatch = self.gate.lock().unwrap();
+        if self.stopping.load(Ordering::SeqCst) {
+            return false;
+        }
+        let stopped = self
+            .join
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|join| join.is_finished());
+        if !stopped
+            && (self.pending.load(Ordering::SeqCst) > 0 || !self.shared.lock().unwrap().can_quit())
+        {
+            return false;
+        }
+        self.stopping.store(true, Ordering::SeqCst);
+        self.cancel.store(true, Ordering::SeqCst);
+        let _ = self.commands.send(Command::Shutdown);
+        true
+    }
+
+    pub fn join(&self) {
+        if let Some(join) = self.join.lock().unwrap().take() {
+            let _ = join.join();
+        }
+    }
 }
+type Subscription = Option<(DateTime<Utc>, DateTime<Utc>)>;
 struct Engine {
     store: Store,
     state: Snapshot,
@@ -263,11 +341,18 @@ struct Engine {
     refresh_failed: bool,
     pending: Arc<AtomicUsize>,
     shared: Arc<Mutex<Snapshot>>,
-    ctx: egui::Context,
+    notifier: Notifier,
     token: Arc<AtomicBool>,
     rt: tokio::runtime::Runtime,
+    // Only lives during one refresh; never retains credential bytes or tokens.
+    subscriptions: Option<HashMap<Uuid, Subscription>>,
 }
 impl Engine {
+    fn publish_batch(&mut self, operation: impl FnOnce(&mut Self)) {
+        self.subscriptions = Some(HashMap::new());
+        operation(self);
+        self.subscriptions = None;
+    }
     fn log(&self) -> PathBuf {
         self.store.root.join("reset-expiry-experiment.jsonl")
     }
@@ -291,6 +376,12 @@ impl Engine {
                 } else {
                     self.store.credential(p.id)
                 };
+                let load_subscription =
+                    || platform::read(&path).ok().and_then(|b| subscription(&b, p));
+                let subscription = match &mut self.subscriptions {
+                    Some(cache) => *cache.entry(p.id).or_insert_with(load_subscription),
+                    None => load_subscription(),
+                };
                 Row {
                     profile: p.clone(),
                     title: self.store.registry.label(p),
@@ -302,7 +393,7 @@ impl Engine {
                         }),
                     fetched_at: cached.map(|e| e.fetched_at),
                     error: self.errors.get(&p.id).cloned(),
-                    subscription: platform::read(&path).ok().and_then(|b| subscription(&b, p)),
+                    subscription,
                 }
             })
             .collect();
@@ -313,7 +404,7 @@ impl Engine {
             snapshot.refreshing &= !queued;
             *latest = snapshot;
         }
-        self.ctx.request_repaint();
+        (self.notifier)();
     }
     fn reset_experiment(&mut self, event: &str) -> Result<()> {
         if self.store.settings.reset_expiry_experiment_enabled {
@@ -479,6 +570,17 @@ impl Engine {
     }
     fn refresh_with(
         &mut self,
+        read_usage: impl FnMut(
+            &tokio::runtime::Runtime,
+            &Path,
+            &Profile,
+            Arc<AtomicBool>,
+        ) -> Result<Usage>,
+    ) {
+        self.publish_batch(|engine| engine.refresh_profiles(read_usage));
+    }
+    fn refresh_profiles(
+        &mut self,
         mut read_usage: impl FnMut(
             &tokio::runtime::Runtime,
             &Path,
@@ -520,6 +622,11 @@ impl Engine {
                 let message = format!("{e:#}");
                 self.refresh_error(anyhow::anyhow!(message.clone()));
                 result = Err(anyhow::anyhow!(message));
+            }
+            // The runtime can rotate tokens even on error/cancellation. Re-read
+            // this profile's subscription rather than serving pre-rotation data.
+            if let Some(cache) = &mut self.subscriptions {
+                cache.remove(&profile.id);
             }
             if self.token.load(Ordering::SeqCst) {
                 break;
@@ -591,6 +698,213 @@ impl Engine {
 mod tests {
     use super::*;
 
+    fn test_worker(snapshot: Snapshot) -> Worker {
+        let shared = Arc::new(Mutex::new(snapshot));
+        let (commands, receiver) = mpsc::channel();
+        let join = std::thread::spawn(move || {
+            while let Ok(command) = receiver.recv() {
+                if matches!(command, Command::Shutdown) {
+                    break;
+                }
+            }
+        });
+        Worker {
+            commands,
+            shared,
+            cancel: Arc::new(AtomicBool::new(false)),
+            pending: Arc::new(AtomicUsize::new(0)),
+            join: Mutex::new(Some(join)),
+            gate: Arc::new(Mutex::new(())),
+            stopping: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn shutdown_blocks_account_operations_but_cancels_refresh_and_joins() {
+        let worker = test_worker(Snapshot {
+            busy: true,
+            ..Default::default()
+        });
+        assert!(!worker.begin_shutdown());
+        assert!(!worker.cancel.load(Ordering::SeqCst));
+        assert!(worker.send(Command::Switch(Uuid::new_v4())).is_err());
+        worker.shared.lock().unwrap().adding = true;
+        assert!(!worker.begin_shutdown());
+        worker.cancel_login().unwrap();
+        assert!(worker.cancel.load(Ordering::SeqCst));
+        worker.cancel.store(false, Ordering::SeqCst);
+        {
+            let mut snapshot = worker.shared.lock().unwrap();
+            snapshot.adding = false;
+            snapshot.refreshing = true;
+        }
+        assert!(worker.begin_shutdown());
+        assert!(worker.cancel.load(Ordering::SeqCst));
+        assert!(worker.send(Command::Refresh).is_err());
+        assert!(!worker.begin_shutdown());
+        worker.join();
+        assert!(worker.join.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn queued_command_blocks_duplicate_commands_and_shutdown() {
+        let worker = test_worker(Snapshot {
+            busy: false,
+            ..Default::default()
+        });
+        worker.send(Command::Register).unwrap();
+        assert!(worker.send(Command::Remove(Uuid::new_v4())).is_err());
+        assert!(!worker.begin_shutdown());
+        assert!(worker.cancel_login().is_err());
+        worker.pending.store(0, Ordering::SeqCst);
+        assert!(worker.begin_shutdown());
+        worker.join();
+    }
+
+    #[test]
+    fn publish_batch_reloads_metadata_after_rotation_and_does_not_cache_between_batches() {
+        if std::env::var_os("SWITCHER_SUBSCRIPTION_TEST_CHILD").is_none() {
+            let isolated = std::env::temp_dir().join(Uuid::new_v4().to_string());
+            let status = platform::hidden_command(std::env::current_exe().unwrap())
+                .args(["--exact", "worker::tests::publish_batch_reloads_metadata_after_rotation_and_does_not_cache_between_batches"])
+                .env("SWITCHER_SUBSCRIPTION_TEST_CHILD", "1")
+                .env("CODEX_SWITCHER_DATA_HOME", isolated).status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("switcher-subscription-{}", Uuid::new_v4()));
+        let mut store = Store::load(root.join("store"), root.join("active")).unwrap();
+        let make_auth = |until: &str| {
+            use base64::Engine as _;
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&serde_json::json!({"https://api.openai.com/auth": {
+                    "chatgpt_account_id": "metadata", "chatgpt_user_id": "test-user",
+                    "chatgpt_subscription_active_until": until,
+                    "chatgpt_subscription_last_checked": "2026-01-01T00:00:00Z"
+                }}))
+                .unwrap(),
+            );
+            serde_json::to_vec(&serde_json::json!({"tokens": {"account_id": "metadata", "id_token": format!("a.{payload}.b")}})).unwrap()
+        };
+        let old = make_auth("2026-02-01T00:00:00Z");
+        let new = make_auth("2026-03-01T00:00:00Z");
+        let profile = identity(&old).unwrap().profile();
+        let id = profile.id;
+        let path = store.credential(id);
+        platform::atomic_write(&path, &old).unwrap();
+        store.add(profile).unwrap();
+        let mut engine = Engine {
+            store,
+            state: Snapshot::default(),
+            errors: HashMap::new(),
+            fresh: HashSet::new(),
+            experiment: None,
+            refresh_failed: false,
+            pending: Arc::new(AtomicUsize::new(0)),
+            shared: Arc::new(Mutex::new(Snapshot::default())),
+            notifier: Arc::new(|| {}),
+            token: Arc::new(AtomicBool::new(false)),
+            rt: tokio::runtime::Runtime::new().unwrap(),
+            subscriptions: None,
+        };
+        engine.publish();
+        assert_eq!(
+            engine.state.rows[0].subscription.unwrap().0.to_rfc3339(),
+            "2026-02-01T00:00:00+00:00"
+        );
+        engine.refresh_with(|_, home, _, _| {
+            platform::atomic_write(&home.join("auth.json"), &new).unwrap();
+            Ok(Usage {
+                remaining_percent: 42,
+                resets_at: None,
+                five_hour_remaining_percent: None,
+                five_hour_resets_at: None,
+                reset_credits_remaining: None,
+                reset_credits: None,
+            })
+        });
+        assert_eq!(
+            engine.state.rows[0].subscription.unwrap().0.to_rfc3339(),
+            "2026-03-01T00:00:00+00:00"
+        );
+        assert!(engine.subscriptions.is_none());
+        platform::atomic_write(&path, b"invalid JSON").unwrap();
+        engine.publish();
+        assert!(engine.state.rows[0].subscription.is_none());
+        drop(engine);
+        platform::remove_tree(&root, &temp).unwrap();
+    }
+
+    // Deliberately excludes setup, network calls and credential writes. Run the
+    // same fixture before/after changes; this is not an end-to-end refresh time.
+    #[test]
+    #[ignore = "manual performance baseline: cargo test benchmark_publish -- --ignored --nocapture"]
+    fn benchmark_publish() {
+        for count in [1, 5, 20] {
+            let temp = std::env::temp_dir();
+            let root = temp.join(format!("switcher-bench-{}", Uuid::new_v4()));
+            let mut store = Store::load(root.join("store"), root.join("active")).unwrap();
+            for index in 0..count {
+                let bytes = credential(&format!("benchmark-{index}"), "fake");
+                let profile = identity(&bytes).unwrap().profile();
+                platform::atomic_write(&store.credential(profile.id), &bytes).unwrap();
+                store.add(profile).unwrap();
+            }
+            let mut engine = Engine {
+                store,
+                state: Snapshot::default(),
+                errors: HashMap::new(),
+                fresh: HashSet::new(),
+                experiment: None,
+                refresh_failed: false,
+                pending: Arc::new(AtomicUsize::new(0)),
+                shared: Arc::new(Mutex::new(Snapshot::default())),
+                notifier: Arc::new(|| {}),
+                token: Arc::new(AtomicBool::new(false)),
+                rt: tokio::runtime::Runtime::new().unwrap(),
+                subscriptions: None,
+            };
+            engine.publish();
+            let expected = serde_json::to_value(&engine.state).unwrap();
+            let mut samples: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+            for sample in 0..7 {
+                // Alternate order to reduce systematic warmup/thermal bias.
+                for mode in if sample % 2 == 0 { [0, 1] } else { [1, 0] } {
+                    let start = Instant::now();
+                    for _ in 0..10 {
+                        let publish_cycle = |engine: &mut Engine| {
+                            for _ in 0..count {
+                                engine.publish();
+                                std::hint::black_box(&engine.state);
+                            }
+                        };
+                        if mode == 0 {
+                            publish_cycle(&mut engine);
+                        } else {
+                            engine.publish_batch(publish_cycle);
+                        }
+                    }
+                    samples[mode].push(start.elapsed().as_secs_f64() * 1000.0 / 10.0);
+                    assert_eq!(serde_json::to_value(&engine.state).unwrap(), expected);
+                }
+            }
+            assert_eq!(engine.state.rows.len(), count);
+            for (mode, samples) in samples.iter_mut().enumerate() {
+                samples.sort_by(f64::total_cmp);
+                println!(
+                    "BENCH_PUBLISH variant={} accounts={count} median_ms={:.4} min_ms={:.4} max_ms={:.4} samples=7 cycles_per_sample=10",
+                    ["uncached", "batch"][mode],
+                    samples[3],
+                    samples[0],
+                    samples[6]
+                );
+            }
+            drop(engine);
+            platform::remove_tree(&root, &temp).unwrap();
+        }
+    }
+
     fn credential(account: &str, refresh_token: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({"tokens": {
             "account_id": account,
@@ -646,9 +960,10 @@ mod tests {
                 refresh_failed: false,
                 pending: Arc::new(AtomicUsize::new(0)),
                 shared: Arc::new(Mutex::new(Snapshot::default())),
-                ctx: egui::Context::default(),
+                notifier: Arc::new(|| {}),
                 token: Arc::new(AtomicBool::new(false)),
                 rt: tokio::runtime::Runtime::new().unwrap(),
+                subscriptions: None,
             };
             let mut homes = Vec::new();
             engine.refresh_with(|_, home, _, token| {
@@ -732,9 +1047,10 @@ mod tests {
             refresh_failed: false,
             pending: Arc::new(AtomicUsize::new(0)),
             shared: Arc::new(Mutex::new(Snapshot::default())),
-            ctx: egui::Context::default(),
+            notifier: Arc::new(|| {}),
             token: Arc::new(AtomicBool::new(false)),
             rt: tokio::runtime::Runtime::new().unwrap(),
+            subscriptions: None,
         };
         engine.refresh_with(|_, _, _, _| {
             platform::atomic_write(&active, &credential("bob", "new")).unwrap();
@@ -769,9 +1085,10 @@ mod tests {
             refresh_failed: false,
             pending: Arc::new(AtomicUsize::new(0)),
             shared: Arc::new(Mutex::new(Snapshot::default())),
-            ctx: egui::Context::default(),
+            notifier: Arc::new(|| {}),
             token: Arc::new(AtomicBool::new(false)),
             rt: tokio::runtime::Runtime::new().unwrap(),
+            subscriptions: None,
         };
         platform::atomic_write(&engine.log(), b"{broken}\n").unwrap();
         let mut settings = engine.store.settings.clone();
@@ -834,9 +1151,10 @@ mod tests {
             refresh_failed: false,
             pending: Arc::new(AtomicUsize::new(0)),
             shared: Arc::new(Mutex::new(Snapshot::default())),
-            ctx: egui::Context::default(),
+            notifier: Arc::new(|| {}),
             token: Arc::new(AtomicBool::new(false)),
             rt: tokio::runtime::Runtime::new().unwrap(),
+            subscriptions: None,
         };
         engine.publish();
         assert!(engine.state.rows[0].stale);
@@ -934,9 +1252,10 @@ mod tests {
             refresh_failed: false,
             pending: Arc::new(AtomicUsize::new(0)),
             shared: Arc::new(Mutex::new(Snapshot::default())),
-            ctx: egui::Context::default(),
+            notifier: Arc::new(|| {}),
             token: Arc::new(AtomicBool::new(false)),
             rt: tokio::runtime::Runtime::new().unwrap(),
+            subscriptions: None,
         };
         engine.refresh();
         assert!(

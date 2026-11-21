@@ -287,6 +287,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn browser_login_cancellation_stops_the_rpc_process() {
+        let script = r#"
+            while ($null -ne ($line = [Console]::ReadLine())) {
+                $request = ConvertFrom-Json -InputObject $line
+                if ($null -eq $request.id) { continue }
+                $result = if ($request.method -eq 'account/login/start') {
+                    '{"authUrl":"https://example.test/login"}'
+                } else { '{}' }
+                [Console]::WriteLine(('{"id":' + $request.id + ',"result":' + $result + '}'))
+            }
+        "#;
+        let exe = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let mut command = tokio::process::Command::new(exe);
+        command
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .creation_flags(0x08000000);
+        let cancel = Arc::new(AtomicBool::new(false));
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session = Session::start_command(command, cancel.clone())
+                .await
+                .unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                session.login_with(Path::new("unused-test-home"), |_| {
+                    cancel.store(true, Ordering::SeqCst);
+                    Ok(())
+                }),
+            )
+            .await
+            .expect("cancelled login kept waiting");
+            assert_eq!(result.unwrap_err().to_string(), "Operation cancelled");
+            session.stop().await;
+            assert!(session.child.try_wait().unwrap().is_some());
+        });
+    }
+
+    #[test]
     fn browser_login_accepts_completion_before_start_response() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let root = std::env::temp_dir().join(format!("switcher-login-{}", uuid::Uuid::new_v4()));

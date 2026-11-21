@@ -380,9 +380,6 @@ impl Drop for OriginalGuard {
     }
 }
 impl Instance {
-    pub fn activation_handle(&self) -> isize {
-        self.activate.0 as isize
-    }
     pub fn acquire() -> Result<Option<Self>> {
         unsafe {
             let mutex = CreateMutexW(None, true, w!("Local\\CatCodexSwitcher"))?;
@@ -398,6 +395,34 @@ impl Instance {
             Ok(Some(Self { mutex, activate }))
         }
     }
+}
+pub fn watch_activation(
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    activate: impl Fn() + Send + 'static,
+) {
+    let _ = watch_activation_event("Local\\CatCodexSwitcher-Activate", stop, activate);
+}
+
+fn watch_activation_event(
+    name: &str,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    activate: impl Fn() + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    let name = wide(name);
+    std::thread::spawn(move || unsafe {
+        // Own a separate handle, so this listener never outlives its handle.
+        if let Ok(event) = CreateEventW(None, false, false, PCWSTR(name.as_ptr())) {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let result = WaitForSingleObject(event, 200);
+                if result == WAIT_OBJECT_0 && !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    activate();
+                } else if result == WAIT_FAILED {
+                    break;
+                }
+            }
+            let _ = CloseHandle(event);
+        }
+    })
 }
 impl Drop for Instance {
     fn drop(&mut self) {
@@ -691,6 +716,34 @@ impl Desktop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activation_listener_delivers_signals_and_stops() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        let name = format!("Local\\Switcher-Activation-Test-{}", uuid::Uuid::new_v4());
+        let event =
+            unsafe { CreateEventW(None, false, false, PCWSTR(wide(&name).as_ptr())).unwrap() };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel();
+        let listener = watch_activation_event(&name, stop.clone(), move || {
+            let _ = sender.send(());
+        });
+        unsafe {
+            SetEvent(event).unwrap();
+        }
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("activation was lost");
+        stop.store(true, Ordering::SeqCst);
+        listener.join().unwrap();
+        unsafe {
+            CloseHandle(event).unwrap();
+        }
+    }
 
     #[test]
     fn original_guard_blocks_equivalent_paths_across_processes() {

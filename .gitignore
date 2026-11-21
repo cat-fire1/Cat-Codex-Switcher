@@ -1,6 +1,10 @@
 /target/
+/src-tauri/target/
 /dist/
 /artifacts/
+/releases-comparison/
+/node_modules/
+/*.exe
 
 # Local credentials and environment overrides
 .env

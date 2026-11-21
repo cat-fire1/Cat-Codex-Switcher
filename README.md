@@ -1,6 +1,6 @@
 # Cat Codex Switcher
 
-Застосунок для Windows, який зберігає кілька акаунтів Codex, перемикає активний вхід і показує ліміти використання у вікні та системному треї. Ядро й інтерфейс написані на Rust із egui/eframe та WGPU.
+Застосунок для Windows, який зберігає кілька акаунтів Codex, перемикає активний вхід і показує ліміти використання у вікні та системному треї. Ядро написане на Rust, інтерфейс — на React і TypeScript; застосунок використовує Tauri v2 та системний WebView2.
 
 Персональна реалізація за Windows-версією Codex Account Switcher 0.1.25. Неофіційний проєкт, не продукт OpenAI.
 
@@ -16,9 +16,9 @@
 
 ## Запуск
 
-Потрібні Windows 10/11 x64, графічний драйвер із підтримкою WGPU та встановлений Codex runtime. Власні .NET, Swift, Node.js і WebView програмі не потрібні. Системні Windows DLL та браузер використовуються через Windows API. EXE не підписаний.
+Потрібні Windows 10/11 x64, Microsoft Edge WebView2 Runtime та встановлений Codex runtime. Node.js потрібен лише для збірки; готовий EXE містить веб-інтерфейс і використовує системний WebView2. Системні Windows DLL та браузер використовуються через Windows API. EXE не підписаний.
 
-Зберіть програму за інструкцією нижче та запустіть `target/release/Cat-Codex-Switcher.exe`. Якщо у вас уже є локальний portable-пакет, запускайте `dist/Cat-Codex-Switcher.exe`. Папка `dist/` не входить до Git-репозиторію; клонування завантажує вихідний код без готового EXE.
+Зберіть програму за інструкцією нижче та запустіть `target/release/Cat-Codex-Switcher.exe`. Якщо у вас уже є локальний portable-пакет, запускайте `releases-comparison/Cat-Codex-Switcher-NEW-Tauri.exe`. Папка `releases-comparison/` не входить до Git-репозиторію; клонування завантажує вихідний код без готового EXE.
 
 Додайте акаунти через браузер у розділі «Керування» або зареєструйте поточний вхід Codex. Виберіть неактивний акаунт у списку й підтвердьте перемикання. Завершіть активні завдання Desktop перед підтвердженням. Програма штатно закриє Desktop, збереже поточний вхід, перевірить вибраний через Codex runtime, активує його й відкриє Desktop. Перевірка примусово оновлює токени та читає ліміти сервісу, тому перемикання потребує мережі. При відмові перевірки активний вхід не замінюється, а Desktop відкривається знову. Уже запущені CLI-сесії зберігають свій стан.
 
@@ -45,34 +45,44 @@ Credentials зберігаються локально як повні `auth.json
 
 Для власних оновлень укажіть `owner/repository` у налаштуваннях. Перевірка ручна або щогодини, якщо її ввімкнено. Порожнє джерело не створює мережевих запитів. Підходять стабільні релізи `vMAJOR.MINOR.PATCH` з asset `Cat-Codex-Switcher.exe`. Нова версія відкривається у браузері для ручної заміни після виходу. Релізи оригіналу не є оновленнями цієї програми.
 
-## Збірка та перевірки
+## Збірка та запуск
 
-Потрібні Rust stable для `x86_64-pc-windows-msvc` і Visual Studio C++ Build Tools із Windows SDK. Версії залежностей зафіксовані в `Cargo.lock`. Налаштування Cargo статично компонують CRT.
+Потрібні:
+- **Rust stable** для `x86_64-pc-windows-msvc` і Visual Studio C++ Build Tools із Windows SDK.
+- **Node.js** (22.22.2+ у гілці 22.x, 24.15+ у гілці 24.x або 26+) та npm для збірки веб-інтерфейсу.
 
 ```powershell
 git clone https://github.com/cat-fire1/Cat-Codex-Switcher.git
 cd Cat-Codex-Switcher
-cargo fmt --check
-cargo test --locked --all-targets
-cargo clippy --locked --all-targets -- -D warnings
-cargo build --locked --release --bin Cat-Codex-Switcher
-.\target\release\Cat-Codex-Switcher.exe
+
+# 1. Встановлення залежностей веб-інтерфейсу
+npm ci
+
+# 2. Тестування інтерфейсу і Rust-бекенду
+npm test
+cargo test
+
+# 3. Запуск у режимі розробки з гарячим перезавантаженням (HMR)
+npx tauri dev
+
+# 4. Складання автономного релізного EXE (без веб-сервера)
+npx tauri build --no-bundle
 ```
 
-Готовий файл після збірки: `target/release/Cat-Codex-Switcher.exe` (або відповідний шлях у `CARGO_TARGET_DIR`, якщо його задано). Для portable-пакета скопіюйте EXE в `dist/` разом із `LICENSE` і повідомленнями ліцензій залежностей. `build.rs` додає іконку та властивості Windows EXE.
+Готовий EXE після збірки: `target/release/Cat-Codex-Switcher.exe`. Весь інтерфейс вшитий всередину EXE, сторонні сервери чи Node.js для запуску готового файлу не потрібні. WebView2 Runtime потрібен. `build.cmd` також копіює EXE у `releases-comparison/` і зберігає кеші для наступної збірки.
 
 ## Структура проєкту
 
 | Шлях | Призначення |
 |---|---|
-| `src/main.rs`, `src/ui.rs`, `src/windows_style.rs` | Запуск і віконний інтерфейс |
-| `src/model.rs`, `src/store.rs` | Моделі, збереження акаунтів, імпорт і перемикання |
-| `src/rpc.rs`, `src/worker.rs` | Codex runtime та фонові операції |
-| `src/platform.rs`, `src/tray.rs` | Інтеграція з Windows і системний трей |
-| `src/i18n.rs` | Переклади інтерфейсу |
-| `src/updates.rs`, `src/experiment.rs` | Перевірка оновлень та журнал спостережень |
-| `assets/` | Логотипи й іконка застосунку |
-| `PARITY.md` | Історичний звіт про відповідність оригіналу та перевірки |
+| `src/` | Веб-інтерфейс (React, TypeScript, Tailwind CSS, Lucide Icons, Framer Motion) |
+| `src-tauri/src/lib.rs` | Tauri v2 команди (IPC), системний трей та життєвий цикл застосунку |
+| `src-tauri/src/model.rs`, `store.rs` | Моделі, безпечне збереження акаунтів, імпорт і перемикання |
+| `src-tauri/src/rpc.rs`, `worker.rs` | Codex runtime, фонові операції та оновлення лімітів |
+| `src-tauri/src/platform.rs` | Інтеграція з Windows API, DACL-безпека, автозапуск, єдиний екземпляр |
+| `src-tauri/src/updates.rs`, `experiment.rs` | Перевірка оновлень з GitHub та журнал спостережень |
+| `assets/`, `public/assets/` | Логотипи та іконки застосунку |
+| `PARITY.md` | Звіт про відповідність оригіналу та перевірки |
 
 ## Стан перевірок
 

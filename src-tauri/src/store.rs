@@ -1,7 +1,7 @@
 use crate::{model::*, platform, rpc};
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
@@ -19,11 +19,13 @@ pub struct Store {
     pub cache: Cache,
     pub warning: Option<String>,
 }
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct ImportPreview {
     pub titles: Vec<String>,
     pub duplicates: usize,
     pub source: PathBuf,
+    #[serde(skip)]
     fingerprint: [u8; 32],
 }
 struct ImportData {
